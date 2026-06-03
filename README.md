@@ -94,7 +94,7 @@ When enabled, adapters reconnect after close or error unless the user called `di
 | --- | --- | --- |
 | macOS | Implemented | C++ worker thread with libcurl and native SSE parser. |
 | Linux | Implemented | C++ worker thread with libcurl and native SSE parser. |
-| Windows | Compile-safe unsupported stub | Add packaged libcurl headers/libs and enable `SSE_USE_LIBCURL` in `ext.manifest` to support Windows. |
+| Windows | Implemented | C++ worker thread with WinHTTP and native SSE parser. |
 | Android | Implemented | Java adapter using OkHttp streaming response and Java SSE parser. |
 | iOS | Implemented | Objective-C++ adapter using `NSURLSessionDataDelegate` streaming and byte-oriented SSE parser. |
 | HTML5 | Implemented | JavaScript `fetch` + `ReadableStream`, chosen so custom headers such as `Authorization` work. |
@@ -114,7 +114,7 @@ examples/
 game.project
 ```
 
-The Android adapter declares OkHttp in `sse/manifests/android/build.gradle`. The iOS adapter uses only Foundation and does not require CocoaPods.
+The Android adapter declares OkHttp in `sse/manifests/android/build.gradle`. The iOS adapter uses only Foundation and does not require CocoaPods. The Windows adapter uses the system WinHTTP library and does not require bundled DLLs.
 
 Desktop macOS/Linux builds expect libcurl to be available in the native-extension build environment. If your Extender image does not provide libcurl, add platform libraries under `sse/lib/<arch-platform>/` and update `sse/ext.manifest`.
 
@@ -125,4 +125,3 @@ See `examples/sse_example.script` for a minimal script component. The sample URL
 ## License
 
 MIT. See `LICENSE`.
-

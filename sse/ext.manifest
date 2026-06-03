@@ -30,6 +30,16 @@ platforms:
             defines: ["SSE_USE_LIBCURL"]
             libs: ["curl", "ssl", "crypto", "z"]
 
+    x86-win32:
+        context:
+            defines: ["SSE_USE_WINHTTP"]
+            libs: ["winhttp"]
+
+    x86_64-win32:
+        context:
+            defines: ["SSE_USE_WINHTTP"]
+            libs: ["winhttp"]
+
     arm64-ios:
         context:
             flags: ["-fblocks"]
