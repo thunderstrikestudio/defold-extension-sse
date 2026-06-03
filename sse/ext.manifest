@@ -1,0 +1,43 @@
+# C++ symbol in your extension. Must match DM_DECLARE_EXTENSION.
+name: "SSEExt"
+
+platforms:
+    common:
+        context:
+            includes: ["upload/sse/include"]
+            flags: ["-std=c++11"]
+            defines: ["SSE_QUEUE_CAPACITY=1024"]
+
+    arm64-osx:
+        context:
+            defines: ["SSE_USE_LIBCURL"]
+            frameworks: ["CoreFoundation", "Foundation", "Security", "SystemConfiguration"]
+            libs: ["curl", "z"]
+
+    x86_64-osx:
+        context:
+            defines: ["SSE_USE_LIBCURL"]
+            frameworks: ["CoreFoundation", "Foundation", "Security", "SystemConfiguration"]
+            libs: ["curl", "z"]
+
+    arm64-linux:
+        context:
+            defines: ["SSE_USE_LIBCURL"]
+            libs: ["curl", "ssl", "crypto", "z"]
+
+    x86_64-linux:
+        context:
+            defines: ["SSE_USE_LIBCURL"]
+            libs: ["curl", "ssl", "crypto", "z"]
+
+    arm64-ios:
+        context:
+            flags: ["-fblocks"]
+            frameworks: ["Foundation"]
+            linkFlags: ["-ObjC"]
+
+    x86_64-ios:
+        context:
+            flags: ["-fblocks"]
+            frameworks: ["Foundation"]
+            linkFlags: ["-ObjC"]

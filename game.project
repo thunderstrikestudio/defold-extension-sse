@@ -1,0 +1,19 @@
+[bootstrap]
+main_collection = /examples/sse.collectionc
+
+[script]
+shared_state = 1
+
+[display]
+width = 960
+height = 540
+
+[project]
+title = extension-sse
+
+[library]
+include_dirs = sse
+
+[sse]
+debug = 0
+

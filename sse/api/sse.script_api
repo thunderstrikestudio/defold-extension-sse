@@ -1,0 +1,91 @@
+- name: sse
+  type: table
+  desc: Server-Sent Events client with custom headers.
+  members:
+
+  - name: connect
+    type: function
+    desc: Opens an SSE stream.
+    parameters:
+      - name: url
+        type: string
+        desc: SSE endpoint URL.
+      - name: options
+        type: table
+        desc: Optional connection parameters.
+        members:
+          - name: headers
+            type: table
+            desc: Request headers applied to every connection and reconnect.
+          - name: last_event_id
+            type: string
+            desc: Initial Last-Event-ID header value.
+          - name: reconnect
+            type: boolean
+            desc: Reconnect after close or error unless disconnect is called.
+          - name: retry_ms
+            type: number
+            desc: Initial reconnect delay in milliseconds.
+      - name: callback
+        type: function
+        desc: Receives function(self, event).
+    returns:
+      - name: handle
+        type: number
+        desc: Numeric connection handle, or nil on failure.
+      - name: error
+        type: string
+        desc: Error string when handle is nil.
+
+  - name: disconnect
+    type: function
+    desc: Closes an SSE stream. Safe to call more than once.
+    parameters:
+      - name: handle
+        type: number
+        desc: Numeric connection handle.
+
+  - name: is_supported
+    type: function
+    desc: Returns true when the current target has an SSE adapter.
+    returns:
+      - name: supported
+        type: boolean
+        desc: Platform support status.
+
+  - name: is_connected
+    type: function
+    desc: Returns true while a handle is open.
+    parameters:
+      - name: handle
+        type: number
+        desc: Numeric connection handle.
+    returns:
+      - name: connected
+        type: boolean
+        desc: Connection state.
+
+  - name: set_debug
+    type: function
+    desc: Enables or disables native debug logging.
+    parameters:
+      - name: enabled
+        type: boolean
+        desc: Debug logging flag.
+
+  - name: EVENT_OPEN
+    type: number
+    desc: Stream opened.
+
+  - name: EVENT_MESSAGE
+    type: number
+    desc: SSE message received.
+
+  - name: EVENT_ERROR
+    type: number
+    desc: Stream error.
+
+  - name: EVENT_CLOSED
+    type: number
+    desc: Stream closed.
+

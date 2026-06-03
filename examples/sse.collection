@@ -1,0 +1,6 @@
+name: "sse"
+instances {
+  id: "controller"
+  prototype: "/examples/sse.go"
+}
+

@@ -1,0 +1,39 @@
+local stream
+
+local function on_sse(self, event)
+    if event.type == sse.EVENT_OPEN then
+        print("SSE open: " .. tostring(event.status))
+    elseif event.type == sse.EVENT_MESSAGE then
+        print("SSE message event=" .. tostring(event.event) .. " id=" .. tostring(event.id))
+        print(event.data)
+    elseif event.type == sse.EVENT_ERROR then
+        print("SSE error: " .. tostring(event.status) .. " " .. tostring(event.error))
+    elseif event.type == sse.EVENT_CLOSED then
+        print("SSE closed")
+        stream = nil
+    end
+end
+
+function init(self)
+    if not sse or not sse.is_supported() then
+        print("SSE is not supported on this platform")
+        return
+    end
+
+    stream = sse.connect("https://example.com/events", {
+        headers = {
+            authorization = "Bearer replace-me",
+            ["Api-Version"] = "1",
+        },
+        reconnect = true,
+        retry_ms = 3000,
+    }, on_sse)
+end
+
+function final(self)
+    if stream then
+        sse.disconnect(stream)
+        stream = nil
+    end
+end
+
