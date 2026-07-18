@@ -509,10 +509,15 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     }
 
     NSURLSessionConfiguration* config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    // No request/resource timeout: an SSE stream may legitimately idle for a
-    // long time. Time-to-first-response is bounded by the watchdog below.
-    config.timeoutIntervalForRequest = 0;
-    config.timeoutIntervalForResource = 0;
+    // An SSE stream may legitimately idle for a long time, so the default
+    // 60s idle / 7-day resource timeouts must not apply. 0 is NOT a
+    // documented "no timeout" value for these properties (the reference
+    // Foundation implementation treats it as an immediate timeout), so use
+    // explicit large finite bounds instead: if one is ever hit the stream
+    // errors and reconnects with Last-Event-ID, which is self-healing.
+    // Time-to-first-response is bounded by the watchdog below.
+    config.timeoutIntervalForRequest = 7.0 * 24.0 * 60.0 * 60.0;   // 7 days idle
+    config.timeoutIntervalForResource = 365.0 * 24.0 * 60.0 * 60.0; // 1 year total
 
     // Deliver all delegate callbacks on the client's serial queue so they
     // never race connect/disconnect/reconnect state changes.
