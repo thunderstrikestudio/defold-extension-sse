@@ -177,7 +177,7 @@ static int32_t SSEDesktop_ComputeRetryDelayMS(int32_t retry_ms, uint32_t failure
     return (int32_t)delay;
 }
 
-static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
+static bool SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
     const bool enqueued = SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
@@ -186,10 +186,12 @@ static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
         // Commit the parser's persistent last-event-id buffer (which also
         // carries id-only checkpoints and empty spec-legal resets) only when
         // the event was actually delivered; otherwise a reconnect would skip
-        // the events dropped on queue overflow.
+        // the events dropped on queue overflow. On a drop the parser rolls
+        // the buffer back so a later commit cannot skip this event either.
         SSEDesktop_SetString(&connection->m_LastEventId, event->m_LastEventId);
         SSE_SetLastEventId(connection->m_Handle, event->m_LastEventId);
     }
+    return enqueued;
 }
 
 static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
@@ -1064,7 +1066,7 @@ static bool SSEWinHTTP_AddHeader(HINTERNET request, const char* name, const char
     return true;
 }
 
-static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
+static bool SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
     const bool enqueued = SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
@@ -1073,10 +1075,12 @@ static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
         // Commit the parser's persistent last-event-id buffer (which also
         // carries id-only checkpoints and empty spec-legal resets) only when
         // the event was actually delivered; otherwise a reconnect would skip
-        // the events dropped on queue overflow.
+        // the events dropped on queue overflow. On a drop the parser rolls
+        // the buffer back so a later commit cannot skip this event either.
         SSEDesktop_SetString(&connection->m_LastEventId, event->m_LastEventId);
         SSE_SetLastEventId(connection->m_Handle, event->m_LastEventId);
     }
+    return enqueued;
 }
 
 static void SSEDesktop_OnParserRetry(void* context, int retry_ms)

@@ -221,7 +221,9 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 
     if ([field isEqualToString:@"data"])
     {
-        if ([self.dataBuffer length] + [value length] > SSE_IOS_MAX_BUFFER)
+        // + 1 accounts for the appended newline, so a flood of empty data:
+        // lines still trips the cap.
+        if ([self.dataBuffer length] + [value length] + 1 > SSE_IOS_MAX_BUFFER)
         {
             [self poisonEvent:"SSE event data exceeded maximum buffer size"];
             return;
@@ -283,15 +285,24 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     NSString* idValue = self.hasId ? self.eventId : @"";
 
     const bool enqueued = SSE_EnqueueMessage(self.handle, [name UTF8String], [self.dataBuffer UTF8String], [idValue UTF8String]);
-    if (enqueued && self.pendingLastEventId != nil)
+    if (enqueued)
     {
-        // Commit the persistent buffer only when the event was actually
-        // delivered; otherwise a reconnect would skip the events dropped on
-        // queue overflow. An empty value is a spec-legal reset and clears
-        // the Last-Event-ID header.
-        self.storedLastEventId = self.pendingLastEventId;
-        self.hasCommittedLastEventId = YES;
-        SSE_SetLastEventId(self.handle, [self.pendingLastEventId UTF8String]);
+        if (self.pendingLastEventId != nil)
+        {
+            // Commit the persistent buffer only when the event was actually
+            // delivered; otherwise a reconnect would skip the events dropped
+            // on queue overflow. An empty value is a spec-legal reset and
+            // clears the Last-Event-ID header.
+            self.storedLastEventId = self.pendingLastEventId;
+            self.hasCommittedLastEventId = YES;
+            SSE_SetLastEventId(self.handle, [self.pendingLastEventId UTF8String]);
+        }
+    }
+    else
+    {
+        // The event was dropped (queue full); roll back its id so a later
+        // commit cannot resume past an undelivered event.
+        self.pendingLastEventId = self.pendingAtBlockStart;
     }
     [self resetEvent];
 }
@@ -434,20 +445,22 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 
 - (void)connect
 {
+    // stopped is NO from init; startRequest simply runs after any already
+    // queued work on the serial queue.
     dispatch_async(self.queue, ^{
-        self.stopped = NO;
         [self startRequest];
     });
 }
 
 - (void)disconnect
 {
-    // Called from the engine main thread; funnel the teardown through the
-    // serial queue so it cannot race delegate callbacks or reconnect blocks.
-    // dispatch_sync is safe: nothing on the client queue blocks on the main
-    // thread, and pending callbacks after this observe stopped == YES.
-    dispatch_sync(self.queue, ^{
-        self.stopped = YES;
+    // Called from the engine main thread. The atomic stopped flag is set
+    // immediately so in-flight callbacks and pending reconnect blocks bail,
+    // and the actual teardown is dispatched asynchronously so the engine
+    // never waits behind queued parser work (the block retains the client,
+    // and the serial queue orders it after any pending delegate callbacks).
+    self.stopped = YES;
+    dispatch_async(self.queue, ^{
         [self.task cancel];
         [self.session invalidateAndCancel];
         self.task = nil;

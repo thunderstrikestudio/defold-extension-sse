@@ -18,7 +18,10 @@ struct SSEParsedEvent
     const char* m_LastEventId;
 };
 
-typedef void (*SSEParserEventFn)(void* context, const SSEParsedEvent* event);
+// Returns whether the event was actually delivered (accepted by the queue).
+// On false the parser rolls its last-event-id buffer back to the previous
+// block boundary, so a dropped event's id can never be committed later.
+typedef bool (*SSEParserEventFn)(void* context, const SSEParsedEvent* event);
 typedef void (*SSEParserRetryFn)(void* context, int retry_ms);
 // Fired when a block containing an id: line ends WITHOUT dispatching an event
 // (an id-only checkpoint). Such a block carries no payload that could be

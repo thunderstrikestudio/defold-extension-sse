@@ -391,7 +391,9 @@ public final class SseClient {
             }
 
             if ("data".equals(field)) {
-                if (data.length() + value.length() > MAX_DATA_CHARS) {
+                // + 1 accounts for the appended newline, so a flood of empty
+                // data: lines still trips the cap.
+                if (data.length() + value.length() + 1 > MAX_DATA_CHARS) {
                     poison("SSE event data exceeded maximum buffer size");
                     return;
                 }
@@ -454,13 +456,19 @@ public final class SseClient {
 
             data.setLength(data.length() - 1);
             boolean enqueued = nativeOnMessage(handle, eventName.length() == 0 ? "message" : eventName, data.toString(), hasId ? eventId : "");
-            if (enqueued && pendingLastEventId != null) {
-                // Commit the persistent buffer only when the event was
-                // actually delivered; otherwise a reconnect would skip the
-                // events dropped on queue overflow. An empty value is a
-                // spec-legal reset and clears the Last-Event-ID header.
-                lastEventId = pendingLastEventId;
-                nativeOnLastEventId(handle, pendingLastEventId);
+            if (enqueued) {
+                if (pendingLastEventId != null) {
+                    // Commit the persistent buffer only when the event was
+                    // actually delivered; otherwise a reconnect would skip
+                    // the events dropped on queue overflow. An empty value is
+                    // a spec-legal reset and clears the Last-Event-ID header.
+                    lastEventId = pendingLastEventId;
+                    nativeOnLastEventId(handle, pendingLastEventId);
+                }
+            } else {
+                // The event was dropped (queue full); roll back its id so a
+                // later commit cannot resume past an undelivered event.
+                pendingLastEventId = pendingAtBlockStart;
             }
             reset();
         }

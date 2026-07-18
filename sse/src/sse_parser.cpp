@@ -224,9 +224,18 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         event.m_Id = m_HasId ? m_Id.c_str() : "";
         event.m_LastEventId = m_HasIdEver ? m_Id.c_str() : 0;
 
+        bool delivered = true;
         if (callbacks && callbacks->m_OnEvent)
         {
-            callbacks->m_OnEvent(context, &event);
+            delivered = callbacks->m_OnEvent(context, &event);
+        }
+
+        if (!delivered)
+        {
+            // The event was dropped (queue full); roll back its id so a
+            // later commit cannot resume past an undelivered event.
+            m_Id = m_IdAtBlockStart;
+            m_HasIdEver = m_HasIdEverAtBlockStart;
         }
     }
 

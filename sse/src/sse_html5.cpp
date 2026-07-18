@@ -178,7 +178,9 @@ bool SSE_Platform_Initialize()
                         value = value.substring(1);
                     }
                     if (field === "data") {
-                        if (client.data.length + value.length > Module.SSEExt.maxBuffer) {
+                        // + 1 accounts for the appended newline, so a flood
+                        // of empty data: lines still trips the cap.
+                        if (client.data.length + value.length + 1 > Module.SSEExt.maxBuffer) {
                             Module.SSEExt.poison(client, "SSE event data exceeded maximum buffer size");
                             return;
                         }
@@ -223,12 +225,20 @@ bool SSE_Platform_Initialize()
                     }
                     var data = client.data.substring(0, client.data.length - 1);
                     var enqueued = Module.SSEExt.callMessage(client.handle, client.eventName || "message", data, client.hasId ? client.eventId : "");
-                    if (enqueued && client.pendingLastEventId !== null) {
-                        // Commit the persistent buffer only when the event
-                        // was actually delivered; otherwise a reconnect
-                        // would skip the events dropped on queue overflow.
-                        client.lastEventId = client.pendingLastEventId;
-                        Module.SSEExt.callLastEventId(client.handle, client.pendingLastEventId);
+                    if (enqueued) {
+                        if (client.pendingLastEventId !== null) {
+                            // Commit the persistent buffer only when the
+                            // event was actually delivered; otherwise a
+                            // reconnect would skip the events dropped on
+                            // queue overflow.
+                            client.lastEventId = client.pendingLastEventId;
+                            Module.SSEExt.callLastEventId(client.handle, client.pendingLastEventId);
+                        }
+                    } else {
+                        // The event was dropped (queue full); roll back its
+                        // id so a later commit cannot resume past an
+                        // undelivered event.
+                        client.pendingLastEventId = client.pendingAtBlockStart;
                     }
                     Module.SSEExt.resetEvent(client);
                 },
