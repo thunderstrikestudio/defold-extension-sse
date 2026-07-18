@@ -141,12 +141,19 @@ bool SSE_Platform_Initialize()
                     client.eventName = "";
                     client.eventId = "";
                     client.hasId = false;
+                    // The block is over; its id state becomes the rollback
+                    // point for a future poisoned block.
+                    client.pendingAtBlockStart = client.pendingLastEventId;
                 },
                 poison: function(client, message) {
                     // The current event lost data to a buffer cap; report it
                     // and suppress the event until its terminating blank line
                     // so a truncated payload is never delivered as complete.
+                    // Any id: the poisoned block already parsed is rolled
+                    // back so a dropped block can never advance the committed
+                    // resume position.
                     Module.SSEExt.callError(client.handle, message, 0, client.reconnect, client.retryMs);
+                    client.pendingLastEventId = client.pendingAtBlockStart;
                     Module.SSEExt.resetEvent(client);
                     client.eventPoisoned = true;
                 },
@@ -283,6 +290,7 @@ bool SSE_Platform_Initialize()
                     client.controller = new AbortController();
                     Module.SSEExt.resetEvent(client);
                     client.pendingLastEventId = null;
+                    client.pendingAtBlockStart = null;
                     client.eventPoisoned = false;
                     client.discardLine = false;
                     client.gotResponse = false;
@@ -450,6 +458,7 @@ bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error
             eventId: "",
             hasId: false,
             pendingLastEventId: null,
+            pendingAtBlockStart: null,
             eventPoisoned: false,
             discardLine: false,
             gotResponse: false,

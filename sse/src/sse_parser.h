@@ -55,13 +55,19 @@ public:
 private:
     void ProcessLine(std::string line, const SSEParserCallbacks* callbacks, void* context);
     void Dispatch(const SSEParserCallbacks* callbacks, void* context);
+    void PoisonEvent();
 
     std::string m_Line;
     std::string m_Data;
     std::string m_Event;
     std::string m_Id;
+    // Rollback point for m_Id/m_HasIdEver: their state at the end of the last
+    // completed block, restored when a block is poisoned so a dropped block's
+    // id is never committed as the resume position.
+    std::string m_IdAtBlockStart;
     bool m_HasId;
     bool m_HasIdEver;
+    bool m_HasIdEverAtBlockStart;
     bool m_FirstLine;
     bool m_DiscardingLine;
     bool m_EventPoisoned;

@@ -62,6 +62,10 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 // and empty spec-legal resets included), nil until the stream sends one.
 // Never cleared by resetEvent so an id-only checkpoint is not lost.
 @property(atomic, retain) NSString* pendingLastEventId;
+// Rollback point: the buffer state at the end of the last completed block,
+// restored when a block is poisoned so a dropped block's id is never
+// committed as the resume position.
+@property(atomic, retain) NSString* pendingAtBlockStart;
 // The committed resume position: pendingLastEventId as of the most recently
 // delivered event. hasCommittedLastEventId distinguishes "" (reset) from
 // "never committed".
@@ -86,6 +90,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 @synthesize eventName;
 @synthesize eventId;
 @synthesize pendingLastEventId;
+@synthesize pendingAtBlockStart;
 @synthesize storedLastEventId;
 @synthesize hasCommittedLastEventId;
 @synthesize hasId;
@@ -108,6 +113,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
         self.eventName = @"";
         self.eventId = @"";
         self.pendingLastEventId = nil;
+        self.pendingAtBlockStart = nil;
         self.storedLastEventId = @"";
         self.hasCommittedLastEventId = NO;
         self.hasId = NO;
@@ -125,6 +131,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     self.eventName = nil;
     self.eventId = nil;
     self.pendingLastEventId = nil;
+    self.pendingAtBlockStart = nil;
     self.storedLastEventId = nil;
     [super dealloc];
 }
@@ -144,8 +151,11 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 {
     // The current event lost data to a buffer cap; report it, reset the
     // accumulated state and suppress the event until its blank line, so a
-    // truncated payload is never delivered as a complete event.
+    // truncated payload is never delivered as a complete event. Any id: the
+    // poisoned block already parsed is rolled back so a dropped block can
+    // never advance the committed resume position.
     SSE_EnqueueError(self.handle, message, 0, self.reconnecting, self.retryMs);
+    self.pendingLastEventId = self.pendingAtBlockStart;
     [self resetEvent];
     self.eventPoisoned = YES;
 }
@@ -292,6 +302,9 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     self.eventName = @"";
     self.eventId = @"";
     self.hasId = NO;
+    // The block is over; its id state becomes the rollback point for a
+    // future poisoned block.
+    self.pendingAtBlockStart = self.pendingLastEventId;
 }
 
 - (void)feedData:(NSData*)data
@@ -527,6 +540,15 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 
 - (void)URLSession:(NSURLSession*)session dataTask:(NSURLSessionDataTask*)dataTask didReceiveResponse:(NSURLResponse*)response completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler
 {
+    if (self.stopped || self.firstResponseTimedOut)
+    {
+        // The watchdog already reported this attempt as timed out (or the
+        // user disconnected) and the task was cancelled; don't surface an
+        // open or status error for it.
+        completionHandler(NSURLSessionResponseCancel);
+        return;
+    }
+
     self.receivedResponse = YES;
 
     NSHTTPURLResponse* http = (NSHTTPURLResponse*)response;

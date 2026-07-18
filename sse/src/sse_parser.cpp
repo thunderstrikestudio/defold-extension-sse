@@ -26,11 +26,24 @@ void SSEParser::Reset()
     m_Data.clear();
     m_Event.clear();
     m_Id.clear();
+    m_IdAtBlockStart.clear();
     m_HasId = false;
     m_HasIdEver = false;
+    m_HasIdEverAtBlockStart = false;
     m_FirstLine = true;
     m_DiscardingLine = false;
     m_EventPoisoned = false;
+}
+
+void SSEParser::PoisonEvent()
+{
+    m_Data.clear();
+    m_HasId = false;
+    m_EventPoisoned = true;
+    // Roll back any id: line the poisoned block may already have parsed, so
+    // a dropped block can never advance the committed resume position.
+    m_Id = m_IdAtBlockStart;
+    m_HasIdEver = m_HasIdEverAtBlockStart;
 }
 
 void SSEParser::Feed(const char* bytes, size_t size, const SSEParserCallbacks* callbacks, void* context)
@@ -66,7 +79,7 @@ void SSEParser::Feed(const char* bytes, size_t size, const SSEParserCallbacks* c
                 }
                 m_Line.clear();
                 m_DiscardingLine = true;
-                m_EventPoisoned = true;
+                PoisonEvent();
             }
         }
     }
@@ -135,8 +148,7 @@ void SSEParser::ProcessLine(std::string line, const SSEParserCallbacks* callback
             {
                 callbacks->m_OnError(context, "SSE event data exceeded maximum buffer size");
             }
-            m_Data.clear();
-            m_EventPoisoned = true;
+            PoisonEvent();
             return;
         }
         m_Data += value;
@@ -189,13 +201,8 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
     if (m_EventPoisoned)
     {
         m_EventPoisoned = false;
-        m_Data.clear();
-        m_Event.clear();
-        m_HasId = false;
-        return;
     }
-
-    if (m_Data.empty())
+    else if (m_Data.empty())
     {
         // An id-only checkpoint block: nothing can be dropped, so let the
         // adapter commit the resume position right away.
@@ -223,10 +230,14 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         }
     }
 
-    // m_Id intentionally survives as the persistent last-event-id buffer.
+    // m_Id intentionally survives as the persistent last-event-id buffer;
+    // the completed block's id state becomes the rollback point for a future
+    // poisoned block.
     m_Data.clear();
     m_Event.clear();
     m_HasId = false;
+    m_IdAtBlockStart = m_Id;
+    m_HasIdEverAtBlockStart = m_HasIdEver;
 }
 
 #endif

@@ -146,6 +146,16 @@ public final class SseClient {
             public void onResponse(Call call, Response response) {
                 boolean timedOut = clearFirstResponseState();
                 try {
+                    if (timedOut) {
+                        // The watchdog already reported this attempt as timed
+                        // out and cancelled the call; don't surface an open
+                        // (or messages) for it, just run the reconnect logic.
+                        if (!stopped) {
+                            scheduleReconnectOrClose();
+                        }
+                        return;
+                    }
+
                     if (!response.isSuccessful()) {
                         nativeOnError(handle, "SSE request failed with HTTP status " + response.code(), response.code(), reconnect, retryMs);
                         scheduleReconnectOrClose();
@@ -170,9 +180,7 @@ public final class SseClient {
                     }
                 } catch (IOException e) {
                     if (!stopped) {
-                        if (!timedOut) {
-                            nativeOnError(handle, e.getMessage() == null ? "SSE stream failed" : e.getMessage(), response.code(), reconnect, retryMs);
-                        }
+                        nativeOnError(handle, e.getMessage() == null ? "SSE stream failed" : e.getMessage(), response.code(), reconnect, retryMs);
                         scheduleReconnectOrClose();
                     }
                 } catch (Throwable t) {
@@ -343,6 +351,10 @@ public final class SseClient {
         // reconnect resume position when the next event is delivered. Never
         // cleared by reset() so an id-only checkpoint is not lost.
         private String pendingLastEventId = null;
+        // Rollback point: the buffer state at the end of the last completed
+        // block, restored when a block is poisoned so a dropped block's id is
+        // never committed as the resume position.
+        private String pendingAtBlockStart = null;
 
         void processLine(String line) {
             if (firstLine) {
@@ -413,6 +425,10 @@ public final class SseClient {
 
         void poison(String message) {
             nativeOnError(handle, message, 0, reconnect, retryMs);
+            // Roll back any id: line the poisoned block may already have
+            // parsed, so a dropped block can never advance the committed
+            // resume position.
+            pendingLastEventId = pendingAtBlockStart;
             reset();
             eventPoisoned = true;
         }
@@ -454,6 +470,9 @@ public final class SseClient {
             eventName = "";
             eventId = "";
             hasId = false;
+            // The block is over; its id state becomes the rollback point for
+            // a future poisoned block.
+            pendingAtBlockStart = pendingLastEventId;
         }
 
         private boolean isInteger(String value) {
