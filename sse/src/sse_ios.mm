@@ -5,16 +5,67 @@
 #import <dispatch/dispatch.h>
 #import <Foundation/Foundation.h>
 
+// Reconnect backoff: the retry base is clamped to a sane range and grows
+// exponentially (capped) with +-20% jitter so clients do not stampede.
+#define SSE_IOS_RETRY_MIN_MS 1000
+#define SSE_IOS_RETRY_MAX_MS 300000
+#define SSE_IOS_MIN_DELAY_MS 500
+#define SSE_IOS_MAX_BACKOFF_SHIFT 8
+// Bound on the time between starting a request and receiving response
+// headers; an established stream may idle indefinitely (no request timeout).
+#define SSE_IOS_FIRST_RESPONSE_TIMEOUT_S 30
+// Cap on the pending line buffer and on the accumulated event data.
+#define SSE_IOS_MAX_BUFFER (1024 * 1024)
+
+static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
+{
+    int64_t base = retry_ms;
+    if (base < SSE_IOS_RETRY_MIN_MS)
+    {
+        base = SSE_IOS_RETRY_MIN_MS;
+    }
+    if (base > SSE_IOS_RETRY_MAX_MS)
+    {
+        base = SSE_IOS_RETRY_MAX_MS;
+    }
+
+    int32_t shift = failures > 1 ? failures - 1 : 0;
+    if (shift > SSE_IOS_MAX_BACKOFF_SHIFT)
+    {
+        shift = SSE_IOS_MAX_BACKOFF_SHIFT;
+    }
+
+    int64_t delay = base << shift;
+    if (delay > SSE_IOS_RETRY_MAX_MS)
+    {
+        delay = SSE_IOS_RETRY_MAX_MS;
+    }
+
+    // +-20% jitter in 0.1% steps.
+    const int64_t jitter = (int64_t)arc4random_uniform(401) - 200;
+    delay += (delay * jitter) / 1000;
+    if (delay < SSE_IOS_MIN_DELAY_MS)
+    {
+        delay = SSE_IOS_MIN_DELAY_MS;
+    }
+
+    return (int32_t)delay;
+}
+
 @interface SseIOSParser : NSObject
-@property(nonatomic, assign) int32_t handle;
-@property(nonatomic, retain) NSMutableData* lineBuffer;
-@property(nonatomic, retain) NSMutableString* dataBuffer;
-@property(nonatomic, retain) NSString* eventName;
-@property(nonatomic, retain) NSString* eventId;
-@property(nonatomic, retain) NSString* storedLastEventId;
-@property(nonatomic, assign) BOOL hasId;
-@property(nonatomic, assign) int32_t retryMs;
-- (id)initWithHandle:(int32_t)handle retryMs:(int32_t)retryMs;
+@property(atomic, assign) int32_t handle;
+@property(atomic, retain) NSMutableData* lineBuffer;
+@property(atomic, retain) NSMutableString* dataBuffer;
+@property(atomic, retain) NSString* eventName;
+@property(atomic, retain) NSString* eventId;
+@property(atomic, retain) NSString* storedLastEventId;
+@property(atomic, assign) BOOL hasId;
+@property(atomic, assign) BOOL reconnecting;
+@property(atomic, assign) BOOL firstLine;
+@property(atomic, assign) BOOL discardingLine;
+@property(atomic, assign) BOOL eventPoisoned;
+@property(atomic, assign) int32_t retryMs;
+- (id)initWithHandle:(int32_t)handle retryMs:(int32_t)retryMs reconnecting:(BOOL)reconnecting;
 - (void)feedData:(NSData*)data;
 - (void)resetEvent;
 @end
@@ -28,21 +79,29 @@
 @synthesize eventId;
 @synthesize storedLastEventId;
 @synthesize hasId;
+@synthesize reconnecting;
+@synthesize firstLine;
+@synthesize discardingLine;
+@synthesize eventPoisoned;
 @synthesize retryMs;
 
-- (id)initWithHandle:(int32_t)inputHandle retryMs:(int32_t)inputRetryMs
+- (id)initWithHandle:(int32_t)inputHandle retryMs:(int32_t)inputRetryMs reconnecting:(BOOL)inputReconnecting
 {
     self = [super init];
     if (self)
     {
         self.handle = inputHandle;
         self.retryMs = inputRetryMs;
+        self.reconnecting = inputReconnecting;
         self.lineBuffer = [NSMutableData data];
         self.dataBuffer = [NSMutableString string];
         self.eventName = @"";
         self.eventId = @"";
         self.storedLastEventId = @"";
         self.hasId = NO;
+        self.firstLine = YES;
+        self.discardingLine = NO;
+        self.eventPoisoned = NO;
     }
     return self;
 }
@@ -68,10 +127,31 @@
     return [value rangeOfCharacterFromSet:nonDigits].location == NSNotFound;
 }
 
+- (void)poisonEvent:(const char*)message
+{
+    // The current event lost data to a buffer cap; report it, reset the
+    // accumulated state and suppress the event until its blank line, so a
+    // truncated payload is never delivered as a complete event.
+    SSE_EnqueueError(self.handle, message, 0, self.reconnecting, self.retryMs);
+    [self resetEvent];
+    self.eventPoisoned = YES;
+}
+
 - (void)processLineData
 {
     NSUInteger length = [self.lineBuffer length];
     const unsigned char* bytes = (const unsigned char*)[self.lineBuffer bytes];
+
+    if (self.firstLine)
+    {
+        self.firstLine = NO;
+        if (length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            bytes += 3;
+            length -= 3;
+        }
+    }
+
     if (length > 0 && bytes[length - 1] == '\r')
     {
         length -= 1;
@@ -82,13 +162,18 @@
 
     if (!line)
     {
-        SSE_EnqueueError(self.handle, "SSE stream contained invalid UTF-8", 0, false, self.retryMs);
+        SSE_EnqueueError(self.handle, "SSE stream contained invalid UTF-8", 0, self.reconnecting, self.retryMs);
         return;
     }
 
     if ([line length] == 0)
     {
         [self dispatchEvent];
+        return;
+    }
+
+    if (self.eventPoisoned)
+    {
         return;
     }
 
@@ -113,6 +198,11 @@
 
     if ([field isEqualToString:@"data"])
     {
+        if ([self.dataBuffer length] + [value length] > SSE_IOS_MAX_BUFFER)
+        {
+            [self poisonEvent:"SSE event data exceeded maximum buffer size"];
+            return;
+        }
         [self.dataBuffer appendString:value];
         [self.dataBuffer appendString:@"\n"];
     }
@@ -123,18 +213,32 @@
     else if ([field isEqualToString:@"id"])
     {
         self.eventId = value;
-        self.storedLastEventId = value;
         self.hasId = YES;
-        SSE_SetLastEventId(self.handle, [value UTF8String]);
     }
     else if ([field isEqualToString:@"retry"] && [self isInteger:value])
     {
-        self.retryMs = [value intValue];
+        long long parsed = [value longLongValue];
+        if (parsed < SSE_IOS_RETRY_MIN_MS)
+        {
+            parsed = SSE_IOS_RETRY_MIN_MS;
+        }
+        if (parsed > SSE_IOS_RETRY_MAX_MS)
+        {
+            parsed = SSE_IOS_RETRY_MAX_MS;
+        }
+        self.retryMs = (int32_t)parsed;
     }
 }
 
 - (void)dispatchEvent
 {
+    if (self.eventPoisoned)
+    {
+        self.eventPoisoned = NO;
+        [self resetEvent];
+        return;
+    }
+
     if ([self.dataBuffer length] == 0)
     {
         [self resetEvent];
@@ -145,7 +249,14 @@
     NSString* name = [self.eventName length] == 0 ? @"message" : self.eventName;
     NSString* idValue = self.hasId ? self.eventId : @"";
 
-    SSE_EnqueueMessage(self.handle, [name UTF8String], [self.dataBuffer UTF8String], [idValue UTF8String]);
+    const bool enqueued = SSE_EnqueueMessage(self.handle, [name UTF8String], [self.dataBuffer UTF8String], [idValue UTF8String]);
+    if (enqueued && self.hasId && [self.eventId length] > 0)
+    {
+        // Only advance the resume position when the event was actually
+        // delivered; otherwise a reconnect would skip the dropped events.
+        self.storedLastEventId = self.eventId;
+        SSE_SetLastEventId(self.handle, [self.eventId UTF8String]);
+    }
     [self resetEvent];
 }
 
@@ -166,11 +277,29 @@
     {
         if (bytes[i] == '\n')
         {
-            [self processLineData];
+            if (self.discardingLine)
+            {
+                self.discardingLine = NO;
+                [self.lineBuffer setLength:0];
+            }
+            else
+            {
+                [self processLineData];
+            }
+        }
+        else if (self.discardingLine)
+        {
+            // Dropping the remainder of an oversized line.
         }
         else
         {
             [self.lineBuffer appendBytes:&bytes[i] length:1];
+            if ([self.lineBuffer length] > SSE_IOS_MAX_BUFFER)
+            {
+                [self poisonEvent:"SSE line exceeded maximum buffer size"];
+                [self.lineBuffer setLength:0];
+                self.discardingLine = YES;
+            }
         }
     }
 }
@@ -178,18 +307,24 @@
 @end
 
 @interface SseIOSClient : NSObject<NSURLSessionDataDelegate>
-@property(nonatomic, assign) int32_t handle;
-@property(nonatomic, retain) NSString* url;
-@property(nonatomic, retain) NSDictionary* headers;
-@property(nonatomic, retain) NSString* lastEventId;
-@property(nonatomic, retain) NSURLSession* session;
-@property(nonatomic, retain) NSURLSessionDataTask* task;
-@property(nonatomic, retain) SseIOSParser* parser;
-@property(nonatomic, assign) BOOL reconnect;
-@property(nonatomic, assign) BOOL stopped;
-@property(nonatomic, assign) BOOL failedResponse;
-@property(nonatomic, assign) int32_t retryMs;
-@property(nonatomic, assign) int32_t status;
+@property(atomic, assign) int32_t handle;
+@property(atomic, retain) NSString* url;
+@property(atomic, retain) NSDictionary* headers;
+@property(atomic, retain) NSString* lastEventId;
+@property(atomic, retain) NSURLSession* session;
+@property(atomic, retain) NSURLSessionDataTask* task;
+@property(atomic, retain) SseIOSParser* parser;
+@property(atomic, assign) BOOL reconnect;
+@property(atomic, assign) BOOL stopped;
+@property(atomic, assign) BOOL failedResponse;
+@property(atomic, assign) BOOL receivedResponse;
+@property(atomic, assign) BOOL firstResponseTimedOut;
+@property(atomic, assign) int32_t retryMs;
+@property(atomic, assign) int32_t status;
+@property(atomic, assign) int32_t failedAttempts;
+// Serial queue that owns all client state mutation: connect, disconnect,
+// reconnect scheduling and every NSURLSession delegate callback run on it.
+@property(atomic, assign) dispatch_queue_t queue;
 - (id)initWithConnection:(SSEConnection*)connection;
 - (void)connect;
 - (void)disconnect;
@@ -207,8 +342,12 @@
 @synthesize reconnect;
 @synthesize stopped;
 @synthesize failedResponse;
+@synthesize receivedResponse;
+@synthesize firstResponseTimedOut;
 @synthesize retryMs;
 @synthesize status;
+@synthesize failedAttempts;
+@synthesize queue;
 
 - (id)initWithConnection:(SSEConnection*)connection
 {
@@ -221,6 +360,8 @@
         self.reconnect = connection->m_Reconnect != 0;
         self.retryMs = connection->m_RetryMS;
         self.status = 0;
+        self.failedAttempts = 0;
+        self.queue = dispatch_queue_create("com.projecttower.sse.client", DISPATCH_QUEUE_SERIAL);
         NSMutableDictionary* headerDict = [NSMutableDictionary dictionary];
         for (uint32_t i = 0; i < connection->m_Headers.Size(); ++i)
         {
@@ -244,24 +385,38 @@
     self.session = nil;
     self.task = nil;
     self.parser = nil;
+    if (self.queue)
+    {
+        dispatch_release(self.queue);
+        self.queue = nil;
+    }
     [super dealloc];
 }
 
 - (void)connect
 {
-    self.stopped = NO;
-    [self startRequest];
+    dispatch_async(self.queue, ^{
+        self.stopped = NO;
+        [self startRequest];
+    });
 }
 
 - (void)disconnect
 {
-    self.stopped = YES;
-    [self.task cancel];
-    [self.session invalidateAndCancel];
-    self.task = nil;
-    self.session = nil;
+    // Called from the engine main thread; funnel the teardown through the
+    // serial queue so it cannot race delegate callbacks or reconnect blocks.
+    // dispatch_sync is safe: nothing on the client queue blocks on the main
+    // thread, and pending callbacks after this observe stopped == YES.
+    dispatch_sync(self.queue, ^{
+        self.stopped = YES;
+        [self.task cancel];
+        [self.session invalidateAndCancel];
+        self.task = nil;
+        self.session = nil;
+    });
 }
 
+// Runs on the serial queue.
 - (void)startRequest
 {
     if (self.stopped)
@@ -270,8 +425,10 @@
     }
 
     self.failedResponse = NO;
+    self.receivedResponse = NO;
+    self.firstResponseTimedOut = NO;
     self.status = 0;
-    self.parser = [[[SseIOSParser alloc] initWithHandle:self.handle retryMs:self.retryMs] autorelease];
+    self.parser = [[[SseIOSParser alloc] initWithHandle:self.handle retryMs:self.retryMs reconnecting:self.reconnect] autorelease];
 
     NSURL* nsurl = [NSURL URLWithString:self.url];
     NSMutableURLRequest* request = [NSMutableURLRequest requestWithURL:nsurl];
@@ -290,14 +447,35 @@
     }
 
     NSURLSessionConfiguration* config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    // No request/resource timeout: an SSE stream may legitimately idle for a
+    // long time. Time-to-first-response is bounded by the watchdog below.
     config.timeoutIntervalForRequest = 0;
     config.timeoutIntervalForResource = 0;
 
-    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:nil];
+    // Deliver all delegate callbacks on the client's serial queue so they
+    // never race connect/disconnect/reconnect state changes.
+    NSOperationQueue* delegateQueue = [[[NSOperationQueue alloc] init] autorelease];
+    delegateQueue.maxConcurrentOperationCount = 1;
+    delegateQueue.underlyingQueue = self.queue;
+
+    self.session = [NSURLSession sessionWithConfiguration:config delegate:self delegateQueue:delegateQueue];
     self.task = [self.session dataTaskWithRequest:request];
     [self.task resume];
+
+    NSURLSessionDataTask* watchedTask = self.task;
+    SseIOSClient* retainedSelf = [self retain];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)SSE_IOS_FIRST_RESPONSE_TIMEOUT_S * (int64_t)NSEC_PER_SEC), self.queue, ^{
+        if (!retainedSelf.stopped && !retainedSelf.receivedResponse && retainedSelf.task == watchedTask)
+        {
+            retainedSelf.firstResponseTimedOut = YES;
+            SSE_EnqueueError(retainedSelf.handle, "SSE timed out waiting for server response", 0, retainedSelf.reconnect, retainedSelf.retryMs);
+            [watchedTask cancel];
+        }
+        [retainedSelf release];
+    });
 }
 
+// Runs on the serial queue.
 - (void)scheduleReconnectOrClose
 {
     if (self.stopped)
@@ -311,9 +489,11 @@
         return;
     }
 
+    self.failedAttempts = self.failedAttempts + 1;
+    const int32_t delay_ms = SseIOS_ComputeRetryDelayMs(self.retryMs, self.failedAttempts);
     SseIOSClient* retainedSelf = [self retain];
-    int64_t delay = (int64_t)self.retryMs * (int64_t)NSEC_PER_MSEC;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+    int64_t delay = (int64_t)delay_ms * (int64_t)NSEC_PER_MSEC;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay), self.queue, ^{
         [retainedSelf startRequest];
         [retainedSelf release];
     });
@@ -321,6 +501,8 @@
 
 - (void)URLSession:(NSURLSession*)session dataTask:(NSURLSessionDataTask*)dataTask didReceiveResponse:(NSURLResponse*)response completionHandler:(void (^)(NSURLSessionResponseDisposition disposition))completionHandler
 {
+    self.receivedResponse = YES;
+
     NSHTTPURLResponse* http = (NSHTTPURLResponse*)response;
     self.status = (int32_t)[http statusCode];
 
@@ -333,6 +515,7 @@
         return;
     }
 
+    self.failedAttempts = 0;
     SSE_EnqueueOpen(self.handle, self.status);
     completionHandler(NSURLSessionResponseAllow);
 }
@@ -351,10 +534,11 @@
         return;
     }
 
-    if (error && !self.failedResponse)
+    if (error && !self.failedResponse && !self.firstResponseTimedOut)
     {
         SSE_EnqueueError(self.handle, [[error localizedDescription] UTF8String], self.status, self.reconnect, self.retryMs);
     }
+    self.firstResponseTimedOut = NO;
 
     self.retryMs = self.parser.retryMs;
     if ([self.parser.storedLastEventId length] > 0)
