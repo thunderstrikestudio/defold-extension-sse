@@ -705,6 +705,11 @@ static dmExtension::Result AppFinalizeSSE(dmExtension::AppParams* params)
             {
                 SSE_FreeEvent(&g_SSE.m_Queue.m_Events[i]);
             }
+            // Empty the arrays before shrinking: dmArray requires the size to
+            // stay within the capacity, and a late platform callback may have
+            // enqueued after the final flush.
+            g_SSE.m_Queue.m_Events.SetSize(0);
+            g_SSE.m_Queue.m_OverflowHandles.SetSize(0);
             g_SSE.m_Queue.m_Events.SetCapacity(0);
             g_SSE.m_Queue.m_EventsSwap.SetCapacity(0);
             g_SSE.m_Queue.m_OverflowHandles.SetCapacity(0);
@@ -718,6 +723,7 @@ static dmExtension::Result AppFinalizeSSE(dmExtension::AppParams* params)
     {
         {
             DM_MUTEX_SCOPED_LOCK(g_SSE.m_Mutex);
+            g_SSE.m_Connections.SetSize(0);
             g_SSE.m_Connections.SetCapacity(0);
         }
         dmMutex::Delete(g_SSE.m_Mutex);

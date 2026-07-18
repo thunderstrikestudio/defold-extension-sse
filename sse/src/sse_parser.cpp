@@ -27,6 +27,7 @@ void SSEParser::Reset()
     m_Event.clear();
     m_Id.clear();
     m_HasId = false;
+    m_HasIdEver = false;
     m_FirstLine = true;
     m_DiscardingLine = false;
     m_EventPoisoned = false;
@@ -147,8 +148,12 @@ void SSEParser::ProcessLine(std::string line, const SSEParserCallbacks* callback
     }
     else if (field == "id")
     {
+        // m_Id doubles as the persistent last-event-id buffer: it is not
+        // cleared between events, so an id-only block still updates the
+        // resume position committed with the next delivered event.
         m_Id = value;
         m_HasId = true;
+        m_HasIdEver = true;
         if (callbacks && callbacks->m_OnId)
         {
             callbacks->m_OnId(context, m_Id.c_str());
@@ -190,7 +195,6 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         m_EventPoisoned = false;
         m_Data.clear();
         m_Event.clear();
-        m_Id.clear();
         m_HasId = false;
         return;
     }
@@ -206,6 +210,7 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         event.m_Event = m_Event.empty() ? "message" : m_Event.c_str();
         event.m_Data = m_Data.c_str();
         event.m_Id = m_HasId ? m_Id.c_str() : "";
+        event.m_LastEventId = m_HasIdEver ? m_Id.c_str() : 0;
 
         if (callbacks && callbacks->m_OnEvent)
         {
@@ -213,9 +218,9 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         }
     }
 
+    // m_Id intentionally survives as the persistent last-event-id buffer.
     m_Data.clear();
     m_Event.clear();
-    m_Id.clear();
     m_HasId = false;
 }
 

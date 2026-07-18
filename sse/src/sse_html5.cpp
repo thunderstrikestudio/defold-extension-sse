@@ -65,28 +65,33 @@ extern "C"
 
     EMSCRIPTEN_KEEPALIVE int SSE_Html5_OnMessage(int handle, const char* event_name, const char* data, const char* id)
     {
-        // Only advance the resume position when the event was actually
-        // accepted by the queue; otherwise a reconnect would skip the
-        // dropped events. The JS side mirrors this via the return value.
-        const bool enqueued = SSE_EnqueueMessage((int32_t)handle, event_name, data, id);
-        if (enqueued && id && id[0])
-        {
-            SSE_SetLastEventId((int32_t)handle, id);
-        }
-        return enqueued ? 1 : 0;
+        // Returns whether the event was accepted by the queue; the JS side
+        // commits the resume position (via SSE_Html5_OnLastEventId) only for
+        // delivered events, so a reconnect does not skip dropped events.
+        return SSE_EnqueueMessage((int32_t)handle, event_name, data, id) ? 1 : 0;
     }
 
     EMSCRIPTEN_KEEPALIVE void SSE_Html5_OnError(int handle, const char* error, int status, int reconnecting, int retry_ms)
     {
-        // Errors mean the stream is down (or never came up); keep
-        // sse.is_connected() truthful during the outage.
-        SSE_SetConnected((int32_t)handle, false);
         SSE_EnqueueError((int32_t)handle, error, (int32_t)status, reconnecting != 0, (int32_t)retry_ms);
     }
 
     EMSCRIPTEN_KEEPALIVE void SSE_Html5_OnClosed(int handle)
     {
         SSE_EnqueueClosed((int32_t)handle);
+    }
+
+    EMSCRIPTEN_KEEPALIVE void SSE_Html5_OnDisconnected(int handle)
+    {
+        // Called when a stream attempt ends (error, EOF, timeout) so
+        // sse.is_connected() stays truthful during outages. Recoverable
+        // parser errors on a live stream deliberately do not reach this.
+        SSE_SetConnected((int32_t)handle, false);
+    }
+
+    EMSCRIPTEN_KEEPALIVE void SSE_Html5_OnLastEventId(int handle, const char* id)
+    {
+        SSE_SetLastEventId((int32_t)handle, id);
     }
 }
 
@@ -125,6 +130,11 @@ bool SSE_Platform_Initialize()
                     var ep = Module.SSEExt.allocString(error);
                     Module._SSE_Html5_OnError(handle, ep, status || 0, reconnecting ? 1 : 0, retryMs || 0);
                     _free(ep);
+                },
+                callLastEventId: function(handle, id) {
+                    var ip = Module.SSEExt.allocString(id);
+                    Module._SSE_Html5_OnLastEventId(handle, ip);
+                    _free(ip);
                 },
                 resetEvent: function(client) {
                     client.data = "";
@@ -171,6 +181,10 @@ bool SSE_Platform_Initialize()
                     } else if (field === "id") {
                         client.eventId = value;
                         client.hasId = true;
+                        // Persistent buffer: survives id-only blocks and
+                        // carries empty spec-legal resets; committed when the
+                        // next event is delivered.
+                        client.pendingLastEventId = value;
                     } else if (field === "retry" && /^[0-9]+$/.test(value)) {
                         var parsed = parseInt(value, 10);
                         if (parsed < Module.SSEExt.retryMinMs) {
@@ -194,11 +208,12 @@ bool SSE_Platform_Initialize()
                     }
                     var data = client.data.substring(0, client.data.length - 1);
                     var enqueued = Module.SSEExt.callMessage(client.handle, client.eventName || "message", data, client.hasId ? client.eventId : "");
-                    if (enqueued && client.hasId && client.eventId.length > 0) {
-                        // Only advance the resume position when the event was
-                        // actually delivered; otherwise a reconnect would
-                        // skip the dropped events.
-                        client.lastEventId = client.eventId;
+                    if (enqueued && client.pendingLastEventId !== null) {
+                        // Commit the persistent buffer only when the event
+                        // was actually delivered; otherwise a reconnect
+                        // would skip the events dropped on queue overflow.
+                        client.lastEventId = client.pendingLastEventId;
+                        Module.SSEExt.callLastEventId(client.handle, client.pendingLastEventId);
                     }
                     Module.SSEExt.resetEvent(client);
                 },
@@ -226,6 +241,11 @@ bool SSE_Platform_Initialize()
                     return Math.floor(delay);
                 },
                 scheduleReconnectOrClose: function(client) {
+                    // Reached whenever a stream attempt has ended, so this is
+                    // the one place the connected flag is truthfully cleared;
+                    // recoverable parser errors on a live stream do not come
+                    // through here.
+                    Module._SSE_Html5_OnDisconnected(client.handle);
                     if (client.stopped) {
                         return;
                     }
@@ -245,6 +265,7 @@ bool SSE_Platform_Initialize()
 
                     client.controller = new AbortController();
                     Module.SSEExt.resetEvent(client);
+                    client.pendingLastEventId = null;
                     client.eventPoisoned = false;
                     client.discardLine = false;
                     client.gotResponse = false;
@@ -407,6 +428,7 @@ bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error
             eventName: "",
             eventId: "",
             hasId: false,
+            pendingLastEventId: null,
             eventPoisoned: false,
             discardLine: false,
             gotResponse: false,

@@ -8,7 +8,14 @@ struct SSEParsedEvent
 {
     const char* m_Event;
     const char* m_Data;
+    // The id: value of this event's own block, or "" if the block had none.
     const char* m_Id;
+    // The parser's persistent last-event-id buffer: the most recent id: value
+    // seen on the stream (id-only blocks included, may be "" for a spec-legal
+    // reset), or NULL when no id: line has been seen since Reset. Adapters
+    // commit this as the reconnect resume position once the event is
+    // successfully delivered.
+    const char* m_LastEventId;
 };
 
 typedef void (*SSEParserEventFn)(void* context, const SSEParsedEvent* event);
@@ -49,6 +56,7 @@ private:
     std::string m_Event;
     std::string m_Id;
     bool m_HasId;
+    bool m_HasIdEver;
     bool m_FirstLine;
     bool m_DiscardingLine;
     bool m_EventPoisoned;

@@ -98,10 +98,6 @@ extern "C"
 
     JNIEXPORT void JNICALL Java_com_projecttower_sse_SseClient_nativeOnError(JNIEnv* env, jclass, jlong handle, jstring error, jint status, jboolean reconnecting, jint retry_ms)
     {
-        // Errors mean the stream is down (or never came up); keep
-        // sse.is_connected() truthful during the outage.
-        SSE_SetConnected((int32_t)handle, false);
-
         const char* error_chars = error ? env->GetStringUTFChars(error, 0) : "SSE error";
         SSE_EnqueueError((int32_t)handle, error_chars, (int32_t)status, reconnecting == JNI_TRUE, (int32_t)retry_ms);
         if (error)
@@ -113,6 +109,15 @@ extern "C"
     JNIEXPORT void JNICALL Java_com_projecttower_sse_SseClient_nativeOnClosed(JNIEnv* env, jclass, jlong handle)
     {
         SSE_EnqueueClosed((int32_t)handle);
+    }
+
+    JNIEXPORT void JNICALL Java_com_projecttower_sse_SseClient_nativeOnDisconnected(JNIEnv* env, jclass, jlong handle)
+    {
+        // Called when a stream attempt ends (error, EOF, timeout) so
+        // sse.is_connected() stays truthful during outages. Recoverable
+        // parser errors on a live stream deliberately do not reach this.
+        (void)env;
+        SSE_SetConnected((int32_t)handle, false);
     }
 
     JNIEXPORT void JNICALL Java_com_projecttower_sse_SseClient_nativeOnRetry(JNIEnv* env, jclass, jlong handle, jint retry_ms)

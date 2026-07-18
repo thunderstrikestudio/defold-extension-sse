@@ -262,6 +262,11 @@ public final class SseClient {
     }
 
     private void scheduleReconnectOrClose() {
+        // Reached whenever a stream attempt has ended (error, EOF, timeout),
+        // so this is the one place the connected flag is truthfully cleared;
+        // recoverable parser errors on a live stream do not go through here.
+        nativeOnDisconnected(handle);
+
         synchronized (lock) {
             if (stopped) {
                 return;
@@ -333,6 +338,11 @@ public final class SseClient {
         private boolean hasId = false;
         private boolean firstLine = true;
         private boolean eventPoisoned = false;
+        // Persistent last-event-id buffer: updated by every id: line (id-only
+        // blocks and empty spec-legal resets included), committed as the
+        // reconnect resume position when the next event is delivered. Never
+        // cleared by reset() so an id-only checkpoint is not lost.
+        private String pendingLastEventId = null;
 
         void processLine(String line) {
             if (firstLine) {
@@ -379,6 +389,7 @@ public final class SseClient {
             } else if ("id".equals(field)) {
                 eventId = value;
                 hasId = true;
+                pendingLastEventId = value;
             } else if ("retry".equals(field) && isInteger(value)) {
                 try {
                     long parsed = Long.parseLong(value);
@@ -416,12 +427,13 @@ public final class SseClient {
 
             data.setLength(data.length() - 1);
             boolean enqueued = nativeOnMessage(handle, eventName.length() == 0 ? "message" : eventName, data.toString(), hasId ? eventId : "");
-            if (enqueued && hasId && eventId.length() > 0) {
-                // Only advance the resume position when the event was
+            if (enqueued && pendingLastEventId != null) {
+                // Commit the persistent buffer only when the event was
                 // actually delivered; otherwise a reconnect would skip the
-                // dropped events.
-                lastEventId = eventId;
-                nativeOnLastEventId(handle, eventId);
+                // events dropped on queue overflow. An empty value is a
+                // spec-legal reset and clears the Last-Event-ID header.
+                lastEventId = pendingLastEventId;
+                nativeOnLastEventId(handle, pendingLastEventId);
             }
             reset();
         }
@@ -452,4 +464,5 @@ public final class SseClient {
     private static native void nativeOnClosed(long handle);
     private static native void nativeOnRetry(long handle, int retryMs);
     private static native void nativeOnLastEventId(long handle, String id);
+    private static native void nativeOnDisconnected(long handle);
 }

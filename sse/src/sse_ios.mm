@@ -58,7 +58,15 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 @property(atomic, retain) NSMutableString* dataBuffer;
 @property(atomic, retain) NSString* eventName;
 @property(atomic, retain) NSString* eventId;
+// Persistent last-event-id buffer: updated by every id: line (id-only blocks
+// and empty spec-legal resets included), nil until the stream sends one.
+// Never cleared by resetEvent so an id-only checkpoint is not lost.
+@property(atomic, retain) NSString* pendingLastEventId;
+// The committed resume position: pendingLastEventId as of the most recently
+// delivered event. hasCommittedLastEventId distinguishes "" (reset) from
+// "never committed".
 @property(atomic, retain) NSString* storedLastEventId;
+@property(atomic, assign) BOOL hasCommittedLastEventId;
 @property(atomic, assign) BOOL hasId;
 @property(atomic, assign) BOOL reconnecting;
 @property(atomic, assign) BOOL firstLine;
@@ -77,7 +85,9 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 @synthesize dataBuffer;
 @synthesize eventName;
 @synthesize eventId;
+@synthesize pendingLastEventId;
 @synthesize storedLastEventId;
+@synthesize hasCommittedLastEventId;
 @synthesize hasId;
 @synthesize reconnecting;
 @synthesize firstLine;
@@ -97,7 +107,9 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
         self.dataBuffer = [NSMutableString string];
         self.eventName = @"";
         self.eventId = @"";
+        self.pendingLastEventId = nil;
         self.storedLastEventId = @"";
+        self.hasCommittedLastEventId = NO;
         self.hasId = NO;
         self.firstLine = YES;
         self.discardingLine = NO;
@@ -112,6 +124,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     self.dataBuffer = nil;
     self.eventName = nil;
     self.eventId = nil;
+    self.pendingLastEventId = nil;
     self.storedLastEventId = nil;
     [super dealloc];
 }
@@ -214,6 +227,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     {
         self.eventId = value;
         self.hasId = YES;
+        self.pendingLastEventId = value;
     }
     else if ([field isEqualToString:@"retry"] && [self isInteger:value])
     {
@@ -250,12 +264,15 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     NSString* idValue = self.hasId ? self.eventId : @"";
 
     const bool enqueued = SSE_EnqueueMessage(self.handle, [name UTF8String], [self.dataBuffer UTF8String], [idValue UTF8String]);
-    if (enqueued && self.hasId && [self.eventId length] > 0)
+    if (enqueued && self.pendingLastEventId != nil)
     {
-        // Only advance the resume position when the event was actually
-        // delivered; otherwise a reconnect would skip the dropped events.
-        self.storedLastEventId = self.eventId;
-        SSE_SetLastEventId(self.handle, [self.eventId UTF8String]);
+        // Commit the persistent buffer only when the event was actually
+        // delivered; otherwise a reconnect would skip the events dropped on
+        // queue overflow. An empty value is a spec-legal reset and clears
+        // the Last-Event-ID header.
+        self.storedLastEventId = self.pendingLastEventId;
+        self.hasCommittedLastEventId = YES;
+        SSE_SetLastEventId(self.handle, [self.pendingLastEventId UTF8String]);
     }
     [self resetEvent];
 }
@@ -541,8 +558,10 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     self.firstResponseTimedOut = NO;
 
     self.retryMs = self.parser.retryMs;
-    if ([self.parser.storedLastEventId length] > 0)
+    if (self.parser.hasCommittedLastEventId)
     {
+        // May be @"" for a spec-legal reset, which suppresses the
+        // Last-Event-ID header on the next attempt.
         self.lastEventId = self.parser.storedLastEventId;
     }
 

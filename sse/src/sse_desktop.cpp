@@ -181,12 +181,14 @@ static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
     const bool enqueued = SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
-    if (enqueued && event->m_Id && event->m_Id[0])
+    if (enqueued && event->m_LastEventId)
     {
-        // Only advance the resume position when the event was actually
-        // delivered; otherwise a reconnect would skip the dropped events.
-        SSEDesktop_SetString(&connection->m_LastEventId, event->m_Id);
-        SSE_SetLastEventId(connection->m_Handle, event->m_Id);
+        // Commit the parser's persistent last-event-id buffer (which also
+        // carries id-only checkpoints and empty spec-legal resets) only when
+        // the event was actually delivered; otherwise a reconnect would skip
+        // the events dropped on queue overflow.
+        SSEDesktop_SetString(&connection->m_LastEventId, event->m_LastEventId);
+        SSE_SetLastEventId(connection->m_Handle, event->m_LastEventId);
     }
 }
 
@@ -1056,12 +1058,14 @@ static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
     const bool enqueued = SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
-    if (enqueued && event->m_Id && event->m_Id[0])
+    if (enqueued && event->m_LastEventId)
     {
-        // Only advance the resume position when the event was actually
-        // delivered; otherwise a reconnect would skip the dropped events.
-        SSEDesktop_SetString(&connection->m_LastEventId, event->m_Id);
-        SSE_SetLastEventId(connection->m_Handle, event->m_Id);
+        // Commit the parser's persistent last-event-id buffer (which also
+        // carries id-only checkpoints and empty spec-legal resets) only when
+        // the event was actually delivered; otherwise a reconnect would skip
+        // the events dropped on queue overflow.
+        SSEDesktop_SetString(&connection->m_LastEventId, event->m_LastEventId);
+        SSE_SetLastEventId(connection->m_Handle, event->m_LastEventId);
     }
 }
 
