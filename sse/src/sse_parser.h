@@ -14,12 +14,22 @@ struct SSEParsedEvent
 typedef void (*SSEParserEventFn)(void* context, const SSEParsedEvent* event);
 typedef void (*SSEParserRetryFn)(void* context, int retry_ms);
 typedef void (*SSEParserIdFn)(void* context, const char* id);
+typedef void (*SSEParserErrorFn)(void* context, const char* message);
 
 struct SSEParserCallbacks
 {
     SSEParserEventFn m_OnEvent;
     SSEParserRetryFn m_OnRetry;
     SSEParserIdFn m_OnId;
+    SSEParserErrorFn m_OnError;
+
+    SSEParserCallbacks()
+    {
+        m_OnEvent = 0;
+        m_OnRetry = 0;
+        m_OnId = 0;
+        m_OnError = 0;
+    }
 };
 
 class SSEParser
@@ -39,7 +49,9 @@ private:
     std::string m_Event;
     std::string m_Id;
     bool m_HasId;
+    bool m_FirstLine;
+    bool m_DiscardingLine;
+    bool m_EventPoisoned;
 };
 
 #endif
-
