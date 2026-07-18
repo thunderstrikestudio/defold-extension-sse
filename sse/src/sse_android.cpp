@@ -37,6 +37,10 @@ static bool SSEAndroid_LoadClass(JNIEnv* env)
 
     if (!g_SSEClientCtor || !g_SSEClientConnect || !g_SSEClientDisconnect)
     {
+        if (env->ExceptionCheck())
+        {
+            env->ExceptionClear();
+        }
         dmLogError("Failed to resolve SseClient JNI methods");
         return false;
     }
@@ -66,17 +70,18 @@ extern "C"
         SSE_EnqueueOpen((int32_t)handle, (int32_t)status);
     }
 
-    JNIEXPORT void JNICALL Java_com_projecttower_sse_SseClient_nativeOnMessage(JNIEnv* env, jclass, jlong handle, jstring event_name, jstring data, jstring id)
+    JNIEXPORT jboolean JNICALL Java_com_projecttower_sse_SseClient_nativeOnMessage(JNIEnv* env, jclass, jlong handle, jstring event_name, jstring data, jstring id)
     {
         const char* event_chars = event_name ? env->GetStringUTFChars(event_name, 0) : 0;
         const char* data_chars = data ? env->GetStringUTFChars(data, 0) : 0;
         const char* id_chars = id ? env->GetStringUTFChars(id, 0) : 0;
 
-        SSE_EnqueueMessage((int32_t)handle, event_chars, data_chars, id_chars);
+        // Last-event-id bookkeeping is done on the Java side, and only after
+        // this reports that the event was actually accepted by the queue.
+        const bool enqueued = SSE_EnqueueMessage((int32_t)handle, event_chars, data_chars, id_chars);
 
         if (id_chars)
         {
-            SSE_SetLastEventId((int32_t)handle, id_chars);
             env->ReleaseStringUTFChars(id, id_chars);
         }
         if (data_chars)
@@ -87,10 +92,16 @@ extern "C"
         {
             env->ReleaseStringUTFChars(event_name, event_chars);
         }
+
+        return enqueued ? JNI_TRUE : JNI_FALSE;
     }
 
     JNIEXPORT void JNICALL Java_com_projecttower_sse_SseClient_nativeOnError(JNIEnv* env, jclass, jlong handle, jstring error, jint status, jboolean reconnecting, jint retry_ms)
     {
+        // Errors mean the stream is down (or never came up); keep
+        // sse.is_connected() truthful during the outage.
+        SSE_SetConnected((int32_t)handle, false);
+
         const char* error_chars = error ? env->GetStringUTFChars(error, 0) : "SSE error";
         SSE_EnqueueError((int32_t)handle, error_chars, (int32_t)status, reconnecting == JNI_TRUE, (int32_t)retry_ms);
         if (error)
@@ -177,6 +188,18 @@ bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error
     env->DeleteLocalRef(keys);
     env->DeleteLocalRef(values);
 
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        if (local_object)
+        {
+            env->DeleteLocalRef(local_object);
+        }
+        dmLogError("SseClient constructor threw a Java exception");
+        dmSnPrintf(error, error_size, "failed to create Android SSE client");
+        return false;
+    }
+
     if (!local_object)
     {
         dmSnPrintf(error, error_size, "failed to create Android SSE client");
@@ -189,6 +212,19 @@ bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error
 
     connection->m_PlatformData = android_client;
     env->CallVoidMethod(android_client->m_Object, g_SSEClientConnect);
+    if (env->ExceptionCheck())
+    {
+        // e.g. OkHttp rejecting a malformed URL; fail the connect gracefully
+        // instead of continuing JNI calls with a pending exception.
+        env->ExceptionClear();
+        dmLogError("SseClient.connect threw a Java exception");
+        connection->m_PlatformData = 0;
+        env->DeleteGlobalRef(android_client->m_Object);
+        delete android_client;
+        dmSnPrintf(error, error_size, "Android SSE client failed to start");
+        return false;
+    }
+
     return true;
 }
 
@@ -203,6 +239,11 @@ void SSE_Platform_Disconnect(SSEConnection* connection)
     dmAndroid::ThreadAttacher thread_attacher;
     JNIEnv* env = thread_attacher.GetEnv();
     env->CallVoidMethod(android_client->m_Object, g_SSEClientDisconnect);
+    if (env->ExceptionCheck())
+    {
+        env->ExceptionClear();
+        dmLogError("SseClient.disconnect threw a Java exception");
+    }
     env->DeleteGlobalRef(android_client->m_Object);
     delete android_client;
     connection->m_PlatformData = 0;
