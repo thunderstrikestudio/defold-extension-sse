@@ -30,6 +30,7 @@ void SSEParser::Reset()
     m_HasId = false;
     m_HasIdEver = false;
     m_HasIdEverAtBlockStart = false;
+    m_DropObserved = false;
     m_FirstLine = true;
     m_DiscardingLine = false;
     m_EventPoisoned = false;
@@ -205,8 +206,10 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
     else if (m_Data.empty())
     {
         // An id-only checkpoint block: nothing can be dropped, so let the
-        // adapter commit the resume position right away.
-        if (m_HasId && callbacks && callbacks->m_OnId)
+        // adapter commit the resume position right away — unless an earlier
+        // event of this stream attempt was dropped, in which case the
+        // resume position stays frozen before that event.
+        if (m_HasId && !m_DropObserved && callbacks && callbacks->m_OnId)
         {
             callbacks->m_OnId(context, m_Id.c_str());
         }
@@ -222,7 +225,7 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         event.m_Event = m_Event.empty() ? "message" : m_Event.c_str();
         event.m_Data = m_Data.c_str();
         event.m_Id = m_HasId ? m_Id.c_str() : "";
-        event.m_LastEventId = m_HasIdEver ? m_Id.c_str() : 0;
+        event.m_LastEventId = (m_HasIdEver && !m_DropObserved) ? m_Id.c_str() : 0;
 
         bool delivered = true;
         if (callbacks && callbacks->m_OnEvent)
@@ -232,10 +235,14 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
 
         if (!delivered)
         {
-            // The event was dropped (queue full); roll back its id so a
-            // later commit cannot resume past an undelivered event.
+            // The event was dropped (queue full); roll back its id and
+            // freeze the resume position for the rest of this attempt, so
+            // neither this nor any later id can commit past an event the
+            // callback never received. The next reconnect replays from
+            // before the drop.
             m_Id = m_IdAtBlockStart;
             m_HasIdEver = m_HasIdEverAtBlockStart;
+            m_DropObserved = true;
         }
     }
 

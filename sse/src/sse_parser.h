@@ -71,6 +71,11 @@ private:
     bool m_HasId;
     bool m_HasIdEver;
     bool m_HasIdEverAtBlockStart;
+    // Set once an event is dropped (queue full). From then on the resume
+    // position is frozen for the rest of this stream attempt, so a later
+    // accepted id can never commit past the undelivered event; the next
+    // reconnect then replays from before the drop.
+    bool m_DropObserved;
     bool m_FirstLine;
     bool m_DiscardingLine;
     bool m_EventPoisoned;

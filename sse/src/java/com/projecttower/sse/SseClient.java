@@ -258,9 +258,14 @@ public final class SseClient {
                 source.skip(newline + 1);
                 return true;
             }
+            // No newline within the search window, so the first
+            // min(buffered, window) bytes are all part of the oversized
+            // line. Skip at most the window so bytes that okio may have
+            // buffered beyond it (the newline and any following events)
+            // are preserved for the next iteration.
             long buffered = source.getBuffer().size();
             if (buffered > 0) {
-                source.skip(buffered);
+                source.skip(Math.min(buffered, MAX_LINE_BYTES));
             }
             if (!source.request(1)) {
                 return false;
@@ -355,6 +360,11 @@ public final class SseClient {
         // block, restored when a block is poisoned so a dropped block's id is
         // never committed as the resume position.
         private String pendingAtBlockStart = null;
+        // Set once an event is dropped (queue full). From then on the resume
+        // position is frozen for the rest of this stream attempt, so a later
+        // accepted id can never commit past the undelivered event; the next
+        // reconnect then replays from before the drop.
+        private boolean dropObserved = false;
 
         void processLine(String line) {
             if (firstLine) {
@@ -443,7 +453,7 @@ public final class SseClient {
             }
 
             if (data.length() == 0) {
-                if (hasId && pendingLastEventId != null) {
+                if (hasId && !dropObserved && pendingLastEventId != null) {
                     // An id-only checkpoint block carries no payload that
                     // could be dropped; commit the resume position now so it
                     // survives a connection drop before the next data event.
@@ -457,7 +467,7 @@ public final class SseClient {
             data.setLength(data.length() - 1);
             boolean enqueued = nativeOnMessage(handle, eventName.length() == 0 ? "message" : eventName, data.toString(), hasId ? eventId : "");
             if (enqueued) {
-                if (pendingLastEventId != null) {
+                if (!dropObserved && pendingLastEventId != null) {
                     // Commit the persistent buffer only when the event was
                     // actually delivered; otherwise a reconnect would skip
                     // the events dropped on queue overflow. An empty value is
@@ -466,9 +476,13 @@ public final class SseClient {
                     nativeOnLastEventId(handle, pendingLastEventId);
                 }
             } else {
-                // The event was dropped (queue full); roll back its id so a
-                // later commit cannot resume past an undelivered event.
+                // The event was dropped (queue full); roll back its id and
+                // freeze the resume position for the rest of this attempt,
+                // so neither this nor any later id can commit past an event
+                // the callback never received. The next reconnect replays
+                // from before the drop.
                 pendingLastEventId = pendingAtBlockStart;
+                dropObserved = true;
             }
             reset();
         }

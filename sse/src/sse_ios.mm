@@ -71,6 +71,11 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 // "never committed".
 @property(atomic, retain) NSString* storedLastEventId;
 @property(atomic, assign) BOOL hasCommittedLastEventId;
+// Set once an event is dropped (queue full). From then on the resume
+// position is frozen for the rest of this stream attempt, so a later
+// accepted id can never commit past the undelivered event; the next
+// reconnect then replays from before the drop.
+@property(atomic, assign) BOOL dropObserved;
 @property(atomic, assign) BOOL hasId;
 @property(atomic, assign) BOOL reconnecting;
 @property(atomic, assign) BOOL firstLine;
@@ -93,6 +98,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 @synthesize pendingAtBlockStart;
 @synthesize storedLastEventId;
 @synthesize hasCommittedLastEventId;
+@synthesize dropObserved;
 @synthesize hasId;
 @synthesize reconnecting;
 @synthesize firstLine;
@@ -116,6 +122,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
         self.pendingAtBlockStart = nil;
         self.storedLastEventId = @"";
         self.hasCommittedLastEventId = NO;
+        self.dropObserved = NO;
         self.hasId = NO;
         self.firstLine = YES;
         self.discardingLine = NO;
@@ -267,7 +274,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 
     if ([self.dataBuffer length] == 0)
     {
-        if (self.hasId && self.pendingLastEventId != nil)
+        if (self.hasId && !self.dropObserved && self.pendingLastEventId != nil)
         {
             // An id-only checkpoint block carries no payload that could be
             // dropped; commit the resume position now so it survives a
@@ -287,7 +294,7 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     const bool enqueued = SSE_EnqueueMessage(self.handle, [name UTF8String], [self.dataBuffer UTF8String], [idValue UTF8String]);
     if (enqueued)
     {
-        if (self.pendingLastEventId != nil)
+        if (!self.dropObserved && self.pendingLastEventId != nil)
         {
             // Commit the persistent buffer only when the event was actually
             // delivered; otherwise a reconnect would skip the events dropped
@@ -300,9 +307,12 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
     }
     else
     {
-        // The event was dropped (queue full); roll back its id so a later
-        // commit cannot resume past an undelivered event.
+        // The event was dropped (queue full); roll back its id and freeze
+        // the resume position for the rest of this attempt, so neither this
+        // nor any later id can commit past an event the callback never
+        // received. The next reconnect replays from before the drop.
         self.pendingLastEventId = self.pendingAtBlockStart;
+        self.dropObserved = YES;
     }
     [self resetEvent];
 }

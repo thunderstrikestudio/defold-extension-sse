@@ -212,7 +212,7 @@ bool SSE_Platform_Initialize()
                         return;
                     }
                     if (client.data.length === 0) {
-                        if (client.hasId && client.pendingLastEventId !== null) {
+                        if (client.hasId && !client.dropObserved && client.pendingLastEventId !== null) {
                             // An id-only checkpoint block carries no payload
                             // that could be dropped; commit the resume
                             // position now so it survives a connection drop
@@ -226,7 +226,7 @@ bool SSE_Platform_Initialize()
                     var data = client.data.substring(0, client.data.length - 1);
                     var enqueued = Module.SSEExt.callMessage(client.handle, client.eventName || "message", data, client.hasId ? client.eventId : "");
                     if (enqueued) {
-                        if (client.pendingLastEventId !== null) {
+                        if (!client.dropObserved && client.pendingLastEventId !== null) {
                             // Commit the persistent buffer only when the
                             // event was actually delivered; otherwise a
                             // reconnect would skip the events dropped on
@@ -236,9 +236,12 @@ bool SSE_Platform_Initialize()
                         }
                     } else {
                         // The event was dropped (queue full); roll back its
-                        // id so a later commit cannot resume past an
-                        // undelivered event.
+                        // id and freeze the resume position for the rest of
+                        // this attempt, so neither this nor any later id can
+                        // commit past an event the callback never received.
+                        // The next reconnect replays from before the drop.
                         client.pendingLastEventId = client.pendingAtBlockStart;
+                        client.dropObserved = true;
                     }
                     Module.SSEExt.resetEvent(client);
                 },
@@ -301,6 +304,7 @@ bool SSE_Platform_Initialize()
                     Module.SSEExt.resetEvent(client);
                     client.pendingLastEventId = null;
                     client.pendingAtBlockStart = null;
+                    client.dropObserved = false;
                     client.eventPoisoned = false;
                     client.discardLine = false;
                     client.gotResponse = false;
@@ -469,6 +473,7 @@ bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error
             hasId: false,
             pendingLastEventId: null,
             pendingAtBlockStart: null,
+            dropObserved: false,
             eventPoisoned: false,
             discardLine: false,
             gotResponse: false,
