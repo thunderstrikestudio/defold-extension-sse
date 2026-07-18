@@ -198,6 +198,15 @@ static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
     connection->m_RetryMS = retry_ms;
 }
 
+static void SSEDesktop_OnParserId(void* context, const char* id)
+{
+    // An id-only checkpoint block carries no payload that could be dropped,
+    // so it is committed as the resume position immediately.
+    SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
+    SSEDesktop_SetString(&connection->m_LastEventId, id);
+    SSE_SetLastEventId(connection->m_Handle, id);
+}
+
 static void SSEDesktop_OnParserError(void* context, const char* message)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
@@ -223,6 +232,7 @@ static size_t SSEDesktop_WriteCallback(char* ptr, size_t size, size_t nmemb, voi
     SSEParserCallbacks callbacks;
     callbacks.m_OnEvent = SSEDesktop_OnParserEvent;
     callbacks.m_OnRetry = SSEDesktop_OnParserRetry;
+    callbacks.m_OnId = SSEDesktop_OnParserId;
     callbacks.m_OnError = SSEDesktop_OnParserError;
     connection->m_Parser.Feed(ptr, total, &callbacks, connection);
 
@@ -1075,6 +1085,15 @@ static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
     connection->m_RetryMS = retry_ms;
 }
 
+static void SSEDesktop_OnParserId(void* context, const char* id)
+{
+    // An id-only checkpoint block carries no payload that could be dropped,
+    // so it is committed as the resume position immediately.
+    SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
+    SSEDesktop_SetString(&connection->m_LastEventId, id);
+    SSE_SetLastEventId(connection->m_Handle, id);
+}
+
 static void SSEDesktop_OnParserError(void* context, const char* message)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
@@ -1087,6 +1106,7 @@ static bool SSEWinHTTP_ReadStream(SSEDesktopConnection* connection, HINTERNET re
     SSEParserCallbacks callbacks;
     callbacks.m_OnEvent = SSEDesktop_OnParserEvent;
     callbacks.m_OnRetry = SSEDesktop_OnParserRetry;
+    callbacks.m_OnId = SSEDesktop_OnParserId;
     callbacks.m_OnError = SSEDesktop_OnParserError;
 
     while (!SSEDesktop_ShouldStop(connection))

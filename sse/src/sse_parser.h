@@ -20,6 +20,11 @@ struct SSEParsedEvent
 
 typedef void (*SSEParserEventFn)(void* context, const SSEParsedEvent* event);
 typedef void (*SSEParserRetryFn)(void* context, int retry_ms);
+// Fired when a block containing an id: line ends WITHOUT dispatching an event
+// (an id-only checkpoint). Such a block carries no payload that could be
+// dropped, so adapters commit it as the resume position immediately; ids of
+// data-bearing blocks are instead committed on successful event delivery via
+// SSEParsedEvent::m_LastEventId.
 typedef void (*SSEParserIdFn)(void* context, const char* id);
 typedef void (*SSEParserErrorFn)(void* context, const char* message);
 

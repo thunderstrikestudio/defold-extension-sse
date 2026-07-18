@@ -203,6 +203,14 @@ bool SSE_Platform_Initialize()
                         return;
                     }
                     if (client.data.length === 0) {
+                        if (client.hasId && client.pendingLastEventId !== null) {
+                            // An id-only checkpoint block carries no payload
+                            // that could be dropped; commit the resume
+                            // position now so it survives a connection drop
+                            // before the next data event.
+                            client.lastEventId = client.pendingLastEventId;
+                            Module.SSEExt.callLastEventId(client.handle, client.pendingLastEventId);
+                        }
                         Module.SSEExt.resetEvent(client);
                         return;
                     }
@@ -263,6 +271,15 @@ bool SSE_Platform_Initialize()
                         return;
                     }
 
+                    // Feature-check before touching any of the APIs so an
+                    // unsupported runtime fails with a visible error instead
+                    // of a rejected promise nobody observes.
+                    if (typeof fetch !== "function" || typeof ReadableStream === "undefined" || typeof AbortController === "undefined") {
+                        Module.SSEExt.callError(client.handle, "fetch streaming (fetch/ReadableStream/AbortController) is not available", 0, false, client.retryMs);
+                        Module._SSE_Html5_OnClosed(client.handle);
+                        return;
+                    }
+
                     client.controller = new AbortController();
                     Module.SSEExt.resetEvent(client);
                     client.pendingLastEventId = null;
@@ -294,12 +311,6 @@ bool SSE_Platform_Initialize()
                     }, Module.SSEExt.firstResponseTimeoutMs);
 
                     try {
-                        if (typeof fetch !== "function" || typeof ReadableStream === "undefined") {
-                            Module.SSEExt.callError(client.handle, "fetch ReadableStream is not available", 0, false, client.retryMs);
-                            Module._SSE_Html5_OnClosed(client.handle);
-                            return;
-                        }
-
                         var response = await fetch(client.url, {
                             method: "GET",
                             headers: requestHeaders,
@@ -343,6 +354,12 @@ bool SSE_Platform_Initialize()
                                     client.discardLine = false;
                                     continue;
                                 }
+                                if (lines[i].length > Module.SSEExt.maxBuffer) {
+                                    // A complete oversized line inside one
+                                    // chunk must not bypass the cap.
+                                    Module.SSEExt.poison(client, "SSE line exceeded maximum buffer size");
+                                    continue;
+                                }
                                 Module.SSEExt.processLine(client, lines[i]);
                             }
                             if (pending.length > Module.SSEExt.maxBuffer) {
@@ -356,7 +373,11 @@ bool SSE_Platform_Initialize()
 
                         pending += decoder.decode();
                         if (pending.length > 0 && !client.discardLine) {
-                            Module.SSEExt.processLine(client, pending);
+                            if (pending.length > Module.SSEExt.maxBuffer) {
+                                Module.SSEExt.poison(client, "SSE line exceeded maximum buffer size");
+                            } else {
+                                Module.SSEExt.processLine(client, pending);
+                            }
                         }
 
                         if (!client.stopped) {

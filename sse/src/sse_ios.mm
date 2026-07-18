@@ -255,6 +255,15 @@ static int32_t SseIOS_ComputeRetryDelayMs(int32_t retry_ms, int32_t failures)
 
     if ([self.dataBuffer length] == 0)
     {
+        if (self.hasId && self.pendingLastEventId != nil)
+        {
+            // An id-only checkpoint block carries no payload that could be
+            // dropped; commit the resume position now so it survives a
+            // connection drop before the next data event.
+            self.storedLastEventId = self.pendingLastEventId;
+            self.hasCommittedLastEventId = YES;
+            SSE_SetLastEventId(self.handle, [self.pendingLastEventId UTF8String]);
+        }
         [self resetEvent];
         return;
     }

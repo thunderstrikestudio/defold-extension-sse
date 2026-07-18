@@ -1,5 +1,7 @@
 #include "sse_private.h"
 
+#include <dmsdk/dlib/time.h>
+
 #include <assert.h>
 #include <atomic>
 #include <stdarg.h>
@@ -28,8 +30,35 @@ static SSEState g_SSE;
 
 // Guards cross-thread entry points against a torn-down queue/state: platform
 // callbacks (NSURLSession, OkHttp, worker threads) may still be draining while
-// AppFinalize deletes the mutexes. Checked before any lock is taken.
+// AppFinalize deletes the mutexes. Entrants register themselves in
+// g_SSEEntrants BEFORE checking the active flag, and AppFinalize clears the
+// flag and then waits for the entrant count to reach zero before deleting the
+// mutexes — so a thread that raced past the flag check is always waited out.
 static std::atomic<bool> g_SSEActive(false);
+static std::atomic<int32_t> g_SSEEntrants(0);
+
+struct SSECallbackGuard
+{
+    bool m_Entered;
+
+    SSECallbackGuard()
+    {
+        g_SSEEntrants.fetch_add(1);
+        m_Entered = g_SSEActive.load();
+        if (!m_Entered)
+        {
+            g_SSEEntrants.fetch_sub(1);
+        }
+    }
+
+    ~SSECallbackGuard()
+    {
+        if (m_Entered)
+        {
+            g_SSEEntrants.fetch_sub(1);
+        }
+    }
+};
 
 static char* SSE_StrDup(const char* value)
 {
@@ -162,7 +191,8 @@ static bool SSE_QueueHasOverflowHandleNoLock(int32_t handle)
 
 static bool SSE_QueuePush(SSEEvent* event)
 {
-    if (!g_SSEActive.load())
+    SSECallbackGuard guard;
+    if (!guard.m_Entered)
     {
         SSE_FreeEvent(event);
         return false;
@@ -235,7 +265,8 @@ void SSE_EnqueueClosed(int32_t handle)
 
 void SSE_SetConnected(int32_t handle, bool connected)
 {
-    if (!g_SSEActive.load())
+    SSECallbackGuard guard;
+    if (!guard.m_Entered)
     {
         return;
     }
@@ -250,7 +281,8 @@ void SSE_SetConnected(int32_t handle, bool connected)
 
 void SSE_SetLastEventId(int32_t handle, const char* last_event_id)
 {
-    if (!g_SSEActive.load())
+    SSECallbackGuard guard;
+    if (!guard.m_Entered)
     {
         return;
     }
@@ -266,7 +298,8 @@ void SSE_SetLastEventId(int32_t handle, const char* last_event_id)
 
 bool SSE_IsUserClosed(int32_t handle)
 {
-    if (!g_SSEActive.load())
+    SSECallbackGuard guard;
+    if (!guard.m_Entered)
     {
         return true;
     }
@@ -692,10 +725,15 @@ static dmExtension::Result FinalizeSSE(dmExtension::Params* params)
 
 static dmExtension::Result AppFinalizeSSE(dmExtension::AppParams* params)
 {
-    // Stop accepting cross-thread pushes, then take each lock once as a
-    // barrier so any thread already inside a critical section leaves before
-    // the mutexes are deleted. Platform adapters were quiesced in FinalizeSSE.
+    // Stop accepting cross-thread pushes, then wait until every entrant that
+    // raced past the active check has left its (short, lock-bounded) critical
+    // section before the mutexes are deleted. Platform adapters were already
+    // quiesced in FinalizeSSE, so this converges immediately in practice.
     g_SSEActive.store(false);
+    while (g_SSEEntrants.load() != 0)
+    {
+        dmTime::Sleep(1000);
+    }
 
     if (g_SSE.m_Queue.m_Mutex)
     {

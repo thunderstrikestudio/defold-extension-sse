@@ -154,10 +154,6 @@ void SSEParser::ProcessLine(std::string line, const SSEParserCallbacks* callback
         m_Id = value;
         m_HasId = true;
         m_HasIdEver = true;
-        if (callbacks && callbacks->m_OnId)
-        {
-            callbacks->m_OnId(context, m_Id.c_str());
-        }
     }
     else if (field == "retry")
     {
@@ -199,7 +195,16 @@ void SSEParser::Dispatch(const SSEParserCallbacks* callbacks, void* context)
         return;
     }
 
-    if (!m_Data.empty())
+    if (m_Data.empty())
+    {
+        // An id-only checkpoint block: nothing can be dropped, so let the
+        // adapter commit the resume position right away.
+        if (m_HasId && callbacks && callbacks->m_OnId)
+        {
+            callbacks->m_OnId(context, m_Id.c_str());
+        }
+    }
+    else
     {
         if (m_Data[m_Data.size() - 1] == '\n')
         {

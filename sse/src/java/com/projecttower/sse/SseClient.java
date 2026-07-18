@@ -391,19 +391,23 @@ public final class SseClient {
                 hasId = true;
                 pendingLastEventId = value;
             } else if ("retry".equals(field) && isInteger(value)) {
+                long parsed;
                 try {
-                    long parsed = Long.parseLong(value);
-                    if (parsed < RETRY_MIN_MS) {
-                        parsed = RETRY_MIN_MS;
-                    }
-                    if (parsed > RETRY_MAX_MS) {
-                        parsed = RETRY_MAX_MS;
-                    }
-                    retryMs = (int) parsed;
-                    nativeOnRetry(handle, retryMs);
+                    parsed = Long.parseLong(value);
                 } catch (NumberFormatException e) {
-                    // Value exceeds Long range; ignore it.
+                    // Digit-only value beyond Long range: treat as very
+                    // large so it clamps to the maximum like the other
+                    // platforms instead of being silently ignored.
+                    parsed = Long.MAX_VALUE;
                 }
+                if (parsed < RETRY_MIN_MS) {
+                    parsed = RETRY_MIN_MS;
+                }
+                if (parsed > RETRY_MAX_MS) {
+                    parsed = RETRY_MAX_MS;
+                }
+                retryMs = (int) parsed;
+                nativeOnRetry(handle, retryMs);
             }
         }
 
@@ -421,6 +425,13 @@ public final class SseClient {
             }
 
             if (data.length() == 0) {
+                if (hasId && pendingLastEventId != null) {
+                    // An id-only checkpoint block carries no payload that
+                    // could be dropped; commit the resume position now so it
+                    // survives a connection drop before the next data event.
+                    lastEventId = pendingLastEventId;
+                    nativeOnLastEventId(handle, pendingLastEventId);
+                }
                 reset();
                 return;
             }
