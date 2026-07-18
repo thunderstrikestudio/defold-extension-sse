@@ -1,13 +1,16 @@
 #include "sse_private.h"
 
 #include <assert.h>
+#include <atomic>
 #include <stdarg.h>
 #include <stdio.h>
 
 struct SSEEventQueue
 {
     dmArray<SSEEvent> m_Events;
+    dmArray<SSEEvent> m_EventsSwap;
     dmArray<int32_t> m_OverflowHandles;
+    dmArray<int32_t> m_OverflowSwap;
     dmMutex::HMutex m_Mutex;
 };
 
@@ -22,6 +25,11 @@ struct SSEState
 };
 
 static SSEState g_SSE;
+
+// Guards cross-thread entry points against a torn-down queue/state: platform
+// callbacks (NSURLSession, OkHttp, worker threads) may still be draining while
+// AppFinalize deletes the mutexes. Checked before any lock is taken.
+static std::atomic<bool> g_SSEActive(false);
 
 static char* SSE_StrDup(const char* value)
 {
@@ -152,8 +160,14 @@ static bool SSE_QueueHasOverflowHandleNoLock(int32_t handle)
     return false;
 }
 
-static void SSE_QueuePush(SSEEvent* event)
+static bool SSE_QueuePush(SSEEvent* event)
 {
+    if (!g_SSEActive.load())
+    {
+        SSE_FreeEvent(event);
+        return false;
+    }
+
     DM_MUTEX_SCOPED_LOCK(g_SSE.m_Queue.m_Mutex);
 
     if (g_SSE.m_Queue.m_Events.Full())
@@ -168,10 +182,11 @@ static void SSE_QueuePush(SSEEvent* event)
         }
 
         SSE_FreeEvent(event);
-        return;
+        return false;
     }
 
     g_SSE.m_Queue.m_Events.Push(*event);
+    return true;
 }
 
 void SSE_EnqueueOpen(int32_t handle, int32_t status)
@@ -185,7 +200,7 @@ void SSE_EnqueueOpen(int32_t handle, int32_t status)
     SSE_QueuePush(&event);
 }
 
-void SSE_EnqueueMessage(int32_t handle, const char* event_name, const char* data, const char* id)
+bool SSE_EnqueueMessage(int32_t handle, const char* event_name, const char* data, const char* id)
 {
     SSEEvent event;
     event.m_Handle = handle;
@@ -193,7 +208,7 @@ void SSE_EnqueueMessage(int32_t handle, const char* event_name, const char* data
     event.m_Event = SSE_StrDup(event_name ? event_name : "message");
     event.m_Data = SSE_StrDup(data ? data : "");
     event.m_Id = SSE_StrDup(id ? id : "");
-    SSE_QueuePush(&event);
+    return SSE_QueuePush(&event);
 }
 
 void SSE_EnqueueError(int32_t handle, const char* error, int32_t status, bool reconnecting, int32_t retry_ms)
@@ -220,6 +235,11 @@ void SSE_EnqueueClosed(int32_t handle)
 
 void SSE_SetConnected(int32_t handle, bool connected)
 {
+    if (!g_SSEActive.load())
+    {
+        return;
+    }
+
     DM_MUTEX_SCOPED_LOCK(g_SSE.m_Mutex);
     SSEConnection* connection = SSE_FindConnectionNoLock(handle);
     if (connection)
@@ -230,6 +250,11 @@ void SSE_SetConnected(int32_t handle, bool connected)
 
 void SSE_SetLastEventId(int32_t handle, const char* last_event_id)
 {
+    if (!g_SSEActive.load())
+    {
+        return;
+    }
+
     DM_MUTEX_SCOPED_LOCK(g_SSE.m_Mutex);
     SSEConnection* connection = SSE_FindConnectionNoLock(handle);
     if (connection)
@@ -241,6 +266,11 @@ void SSE_SetLastEventId(int32_t handle, const char* last_event_id)
 
 bool SSE_IsUserClosed(int32_t handle)
 {
+    if (!g_SSEActive.load())
+    {
+        return true;
+    }
+
     DM_MUTEX_SCOPED_LOCK(g_SSE.m_Mutex);
     SSEConnection* connection = SSE_FindConnectionNoLock(handle);
     return !connection || connection->m_UserClosed != 0;
@@ -325,11 +355,21 @@ static void SSE_DispatchEvent(const SSEEvent* event)
         return;
     }
 
+    if (!dmScript::IsCallbackValid(connection->m_Callback))
+    {
+        // The owning script instance died without calling sse.disconnect; tear
+        // the connection down so the network thread stops reconnecting forever.
+        SSE_DebugLog("callback no longer valid; destroying orphaned connection handle=%d", connection->m_Handle);
+        connection->m_UserClosed = 1;
+        SSE_DestroyConnection(connection, true);
+        return;
+    }
+
     lua_State* L = dmScript::GetCallbackLuaContext(connection->m_Callback);
     int top = lua_gettop(L);
     connection->m_Dispatching = 1;
 
-    if (dmScript::IsCallbackValid(connection->m_Callback) && dmScript::SetupCallback(connection->m_Callback))
+    if (dmScript::SetupCallback(connection->m_Callback))
     {
         SSE_PushEventTable(L, event);
         dmScript::PCall(L, 2, 0);
@@ -361,14 +401,15 @@ static void SSE_DispatchOverflow(int32_t handle)
 
 static void SSE_FlushQueue()
 {
-    dmArray<SSEEvent> events;
-    dmArray<int32_t> overflow_handles;
+    // Swap with persistent scratch arrays so the backing buffers are reused
+    // between updates instead of being freed and re-allocated every frame.
+    dmArray<SSEEvent>& events = g_SSE.m_Queue.m_EventsSwap;
+    dmArray<int32_t>& overflow_handles = g_SSE.m_Queue.m_OverflowSwap;
 
     {
         DM_MUTEX_SCOPED_LOCK(g_SSE.m_Queue.m_Mutex);
-        events.Swap(g_SSE.m_Queue.m_Events);
-        overflow_handles.Swap(g_SSE.m_Queue.m_OverflowHandles);
-        g_SSE.m_Queue.m_Events.SetCapacity(SSE_QUEUE_CAPACITY);
+        g_SSE.m_Queue.m_Events.Swap(events);
+        g_SSE.m_Queue.m_OverflowHandles.Swap(overflow_handles);
     }
 
     for (uint32_t i = 0; i < events.Size(); ++i)
@@ -376,26 +417,40 @@ static void SSE_FlushQueue()
         SSE_DispatchEvent(&events[i]);
         SSE_FreeEvent(&events[i]);
     }
+    events.SetSize(0);
 
     for (uint32_t i = 0; i < overflow_handles.Size(); ++i)
     {
         SSE_DispatchOverflow(overflow_handles[i]);
     }
+    overflow_handles.SetSize(0);
 }
 
-static bool SSE_ReadOptions(lua_State* L, int options_index, SSEConnection* connection)
+// Reads the options table without raising Lua errors: a longjmp here would
+// leak the connection struct and its callback ref (which pins the script
+// instance). Returns false with a message in error instead.
+static bool SSE_ReadOptions(lua_State* L, int options_index, SSEConnection* connection, char* error, uint32_t error_size)
 {
     if (options_index <= 0 || lua_isnil(L, options_index))
     {
         return true;
     }
 
-    luaL_checktype(L, options_index, LUA_TTABLE);
+    if (!lua_istable(L, options_index))
+    {
+        dmSnPrintf(error, error_size, "sse.connect options must be a table");
+        return false;
+    }
 
     lua_getfield(L, options_index, "headers");
     if (!lua_isnil(L, -1))
     {
-        luaL_checktype(L, -1, LUA_TTABLE);
+        if (!lua_istable(L, -1))
+        {
+            lua_pop(L, 1);
+            dmSnPrintf(error, error_size, "sse.connect options.headers must be a table");
+            return false;
+        }
         lua_pushnil(L);
         while (lua_next(L, -2) != 0)
         {
@@ -416,8 +471,15 @@ static bool SSE_ReadOptions(lua_State* L, int options_index, SSEConnection* conn
     lua_getfield(L, options_index, "last_event_id");
     if (!lua_isnil(L, -1))
     {
+        const char* last_event_id = lua_tostring(L, -1);
+        if (!last_event_id)
+        {
+            lua_pop(L, 1);
+            dmSnPrintf(error, error_size, "sse.connect options.last_event_id must be a string");
+            return false;
+        }
         free(connection->m_LastEventId);
-        connection->m_LastEventId = SSE_StrDup(luaL_checkstring(L, -1));
+        connection->m_LastEventId = SSE_StrDup(last_event_id);
     }
     lua_pop(L, 1);
 
@@ -431,7 +493,13 @@ static bool SSE_ReadOptions(lua_State* L, int options_index, SSEConnection* conn
     lua_getfield(L, options_index, "retry_ms");
     if (!lua_isnil(L, -1))
     {
-        const int retry_ms = (int)luaL_checkinteger(L, -1);
+        if (!lua_isnumber(L, -1))
+        {
+            lua_pop(L, 1);
+            dmSnPrintf(error, error_size, "sse.connect options.retry_ms must be a number");
+            return false;
+        }
+        const int retry_ms = (int)lua_tointeger(L, -1);
         connection->m_RetryMS = retry_ms >= 0 ? retry_ms : 0;
     }
     lua_pop(L, 1);
@@ -473,7 +541,15 @@ static int SSE_Connect(lua_State* L)
         return 2;
     }
 
-    SSE_ReadOptions(L, options_index, connection);
+    char error[256];
+    error[0] = 0;
+    if (!SSE_ReadOptions(L, options_index, connection, error, sizeof(error)))
+    {
+        SSE_DestroyConnection(connection, false);
+        lua_pushnil(L);
+        lua_pushstring(L, error[0] ? error : "invalid sse.connect options");
+        return 2;
+    }
 
     {
         DM_MUTEX_SCOPED_LOCK(g_SSE.m_Mutex);
@@ -484,8 +560,6 @@ static int SSE_Connect(lua_State* L)
         g_SSE.m_Connections.Push(connection);
     }
 
-    char error[256];
-    error[0] = 0;
     if (!SSE_Platform_Connect(connection, error, sizeof(error)))
     {
         SSE_DestroyConnection(connection, false);
@@ -581,6 +655,8 @@ static dmExtension::Result AppInitializeSSE(dmExtension::AppParams* params)
     g_SSE.m_Mutex = dmMutex::New();
     g_SSE.m_Queue.m_Mutex = dmMutex::New();
     g_SSE.m_Queue.m_Events.SetCapacity(SSE_QUEUE_CAPACITY);
+    g_SSE.m_Queue.m_EventsSwap.SetCapacity(SSE_QUEUE_CAPACITY);
+    g_SSEActive.store(true);
     return dmExtension::RESULT_OK;
 }
 
@@ -598,6 +674,7 @@ static dmExtension::Result InitializeSSE(dmExtension::Params* params)
 static dmExtension::Result UpdateSSE(dmExtension::Params* params)
 {
     SSE_FlushQueue();
+    SSE_Platform_Update();
     return dmExtension::RESULT_OK;
 }
 
@@ -615,14 +692,34 @@ static dmExtension::Result FinalizeSSE(dmExtension::Params* params)
 
 static dmExtension::Result AppFinalizeSSE(dmExtension::AppParams* params)
 {
+    // Stop accepting cross-thread pushes, then take each lock once as a
+    // barrier so any thread already inside a critical section leaves before
+    // the mutexes are deleted. Platform adapters were quiesced in FinalizeSSE.
+    g_SSEActive.store(false);
+
     if (g_SSE.m_Queue.m_Mutex)
     {
+        {
+            DM_MUTEX_SCOPED_LOCK(g_SSE.m_Queue.m_Mutex);
+            for (uint32_t i = 0; i < g_SSE.m_Queue.m_Events.Size(); ++i)
+            {
+                SSE_FreeEvent(&g_SSE.m_Queue.m_Events[i]);
+            }
+            g_SSE.m_Queue.m_Events.SetCapacity(0);
+            g_SSE.m_Queue.m_EventsSwap.SetCapacity(0);
+            g_SSE.m_Queue.m_OverflowHandles.SetCapacity(0);
+            g_SSE.m_Queue.m_OverflowSwap.SetCapacity(0);
+        }
         dmMutex::Delete(g_SSE.m_Queue.m_Mutex);
         g_SSE.m_Queue.m_Mutex = 0;
     }
 
     if (g_SSE.m_Mutex)
     {
+        {
+            DM_MUTEX_SCOPED_LOCK(g_SSE.m_Mutex);
+            g_SSE.m_Connections.SetCapacity(0);
+        }
         dmMutex::Delete(g_SSE.m_Mutex);
         g_SSE.m_Mutex = 0;
     }
