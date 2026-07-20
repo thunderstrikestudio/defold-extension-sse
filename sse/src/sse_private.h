@@ -67,7 +67,10 @@ struct SSEConnection
 };
 
 void SSE_EnqueueOpen(int32_t handle, int32_t status);
-void SSE_EnqueueMessage(int32_t handle, const char* event_name, const char* data, const char* id);
+// Returns true when the event was accepted by the queue, false when it was dropped
+// (queue full or extension shut down). Callers should only advance last-event-id
+// bookkeeping when the event was actually enqueued.
+bool SSE_EnqueueMessage(int32_t handle, const char* event_name, const char* data, const char* id);
 void SSE_EnqueueError(int32_t handle, const char* error, int32_t status, bool reconnecting, int32_t retry_ms);
 void SSE_EnqueueClosed(int32_t handle);
 
@@ -83,6 +86,9 @@ bool SSE_Platform_IsSupported();
 bool SSE_Platform_Connect(SSEConnection* connection, char* error, uint32_t error_size);
 void SSE_Platform_Disconnect(SSEConnection* connection);
 bool SSE_Platform_IsConnected(SSEConnection* connection);
+// Called from the extension Update on the engine main thread; platforms use it
+// to reap finished worker threads without blocking disconnect.
+void SSE_Platform_Update();
 
 #endif
 

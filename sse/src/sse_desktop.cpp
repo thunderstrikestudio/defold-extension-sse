@@ -23,6 +23,14 @@
 #include <winhttp.h>
 #endif
 
+// Reconnect backoff parameters shared by both desktop implementations.
+#define SSE_DESKTOP_RETRY_MIN_MS 1000
+#define SSE_DESKTOP_RETRY_MAX_MS 300000
+#define SSE_DESKTOP_MIN_DELAY_MS 500
+#define SSE_DESKTOP_MAX_BACKOFF_SHIFT 8
+// Bound on the time between starting a request and receiving response headers.
+#define SSE_DESKTOP_FIRST_RESPONSE_TIMEOUT_US (30ull * 1000000ull)
+
 #if defined(SSE_USE_LIBCURL)
 
 struct SSEDesktopConnection
@@ -37,9 +45,12 @@ struct SSEDesktopConnection
     CURL* m_Curl;
     int32_t m_RetryMS;
     int32_t m_Status;
+    uint64_t m_AttemptStart;
     uint8_t m_Reconnect;
     uint8_t m_Stop;
     uint8_t m_Opened;
+    uint8_t m_FirstResponseTimedOut;
+    uint8_t m_Finished;
 
     SSEDesktopConnection()
     : m_Handle(0)
@@ -50,14 +61,23 @@ struct SSEDesktopConnection
     , m_Curl(0)
     , m_RetryMS(3000)
     , m_Status(0)
+    , m_AttemptStart(0)
     , m_Reconnect(0)
     , m_Stop(0)
     , m_Opened(0)
+    , m_FirstResponseTimedOut(0)
+    , m_Finished(0)
     {
     }
 };
 
 static uint8_t g_CurlInitialized = 0;
+
+// Connections whose worker thread had not exited when disconnect was called.
+// They are joined and freed from SSE_Platform_Update (engine main thread)
+// once the worker signals completion, so disconnect never blocks a frame.
+static dmArray<SSEDesktopConnection*> g_SSEDesktopZombies;
+static dmMutex::HMutex g_SSEDesktopZombiesMutex = 0;
 
 static char* SSEDesktop_StrDup(const char* value)
 {
@@ -92,15 +112,86 @@ static void SSEDesktop_SetCurl(SSEDesktopConnection* connection, CURL* curl)
     connection->m_Curl = curl;
 }
 
-static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
+static void SSEDesktop_MarkFinished(SSEDesktopConnection* connection)
+{
+    DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
+    connection->m_Finished = 1;
+}
+
+static bool SSEDesktop_IsFinished(SSEDesktopConnection* connection)
+{
+    DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
+    return connection->m_Finished != 0;
+}
+
+static void SSEDesktop_Free(SSEDesktopConnection* desktop)
+{
+    for (uint32_t i = 0; i < desktop->m_Headers.Size(); ++i)
+    {
+        free(desktop->m_Headers[i].m_Name);
+        free(desktop->m_Headers[i].m_Value);
+    }
+
+    if (desktop->m_Mutex)
+    {
+        dmMutex::Delete(desktop->m_Mutex);
+    }
+
+    free(desktop->m_Url);
+    free(desktop->m_LastEventId);
+    delete desktop;
+}
+
+static int32_t SSEDesktop_ComputeRetryDelayMS(int32_t retry_ms, uint32_t failures)
+{
+    int64_t base = retry_ms;
+    if (base < SSE_DESKTOP_RETRY_MIN_MS)
+    {
+        base = SSE_DESKTOP_RETRY_MIN_MS;
+    }
+    if (base > SSE_DESKTOP_RETRY_MAX_MS)
+    {
+        base = SSE_DESKTOP_RETRY_MAX_MS;
+    }
+
+    uint32_t shift = failures > 1 ? failures - 1 : 0;
+    if (shift > SSE_DESKTOP_MAX_BACKOFF_SHIFT)
+    {
+        shift = SSE_DESKTOP_MAX_BACKOFF_SHIFT;
+    }
+
+    int64_t delay = base << shift;
+    if (delay > SSE_DESKTOP_RETRY_MAX_MS)
+    {
+        delay = SSE_DESKTOP_RETRY_MAX_MS;
+    }
+
+    // +-20% jitter so reconnecting clients spread out instead of stampeding.
+    const int64_t jitter = (int64_t)(dmTime::GetTime() % 401) - 200;
+    delay += (delay * jitter) / 1000;
+    if (delay < SSE_DESKTOP_MIN_DELAY_MS)
+    {
+        delay = SSE_DESKTOP_MIN_DELAY_MS;
+    }
+
+    return (int32_t)delay;
+}
+
+static bool SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
-    if (event->m_Id && event->m_Id[0])
+    const bool enqueued = SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
+    if (enqueued && event->m_LastEventId)
     {
-        SSEDesktop_SetString(&connection->m_LastEventId, event->m_Id);
-        SSE_SetLastEventId(connection->m_Handle, event->m_Id);
+        // Commit the parser's persistent last-event-id buffer (which also
+        // carries id-only checkpoints and empty spec-legal resets) only when
+        // the event was actually delivered; otherwise a reconnect would skip
+        // the events dropped on queue overflow. On a drop the parser rolls
+        // the buffer back so a later commit cannot skip this event either.
+        SSEDesktop_SetString(&connection->m_LastEventId, event->m_LastEventId);
+        SSE_SetLastEventId(connection->m_Handle, event->m_LastEventId);
     }
-    SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
+    return enqueued;
 }
 
 static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
@@ -111,9 +202,17 @@ static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
 
 static void SSEDesktop_OnParserId(void* context, const char* id)
 {
+    // An id-only checkpoint block carries no payload that could be dropped,
+    // so it is committed as the resume position immediately.
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
     SSEDesktop_SetString(&connection->m_LastEventId, id);
     SSE_SetLastEventId(connection->m_Handle, id);
+}
+
+static void SSEDesktop_OnParserError(void* context, const char* message)
+{
+    SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
+    SSE_EnqueueError(connection->m_Handle, message, 0, connection->m_Reconnect != 0, connection->m_RetryMS);
 }
 
 static size_t SSEDesktop_WriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
@@ -136,6 +235,7 @@ static size_t SSEDesktop_WriteCallback(char* ptr, size_t size, size_t nmemb, voi
     callbacks.m_OnEvent = SSEDesktop_OnParserEvent;
     callbacks.m_OnRetry = SSEDesktop_OnParserRetry;
     callbacks.m_OnId = SSEDesktop_OnParserId;
+    callbacks.m_OnError = SSEDesktop_OnParserError;
     connection->m_Parser.Feed(ptr, total, &callbacks, connection);
 
     return total;
@@ -153,8 +253,15 @@ static size_t SSEDesktop_HeaderCallback(char* ptr, size_t size, size_t nmemb, vo
 
     if (total >= 5 && strncmp(ptr, "HTTP/", 5) == 0)
     {
+        // curl header callback data is not NUL-terminated; copy the status
+        // line into a bounded buffer before letting sscanf scan it.
+        char status_line[64];
+        const size_t copy_length = total < sizeof(status_line) - 1 ? total : sizeof(status_line) - 1;
+        memcpy(status_line, ptr, copy_length);
+        status_line[copy_length] = 0;
+
         int status = 0;
-        if (sscanf(ptr, "HTTP/%*s %d", &status) == 1)
+        if (sscanf(status_line, "HTTP/%*s %d", &status) == 1)
         {
             connection->m_Status = status;
             connection->m_Opened = 0;
@@ -175,7 +282,20 @@ static size_t SSEDesktop_HeaderCallback(char* ptr, size_t size, size_t nmemb, vo
 static int SSEDesktop_ProgressCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)clientp;
-    return SSEDesktop_ShouldStop(connection) ? 1 : 0;
+    if (SSEDesktop_ShouldStop(connection))
+    {
+        return 1;
+    }
+
+    // Abort if the server accepted the connection but never finished sending
+    // response headers; an opened stream is allowed to idle indefinitely.
+    if (!connection->m_Opened && (dmTime::GetTime() - connection->m_AttemptStart) > SSE_DESKTOP_FIRST_RESPONSE_TIMEOUT_US)
+    {
+        connection->m_FirstResponseTimedOut = 1;
+        return 1;
+    }
+
+    return 0;
 }
 
 static void SSEDesktop_AddHeader(struct curl_slist** headers, const char* name, const char* value)
@@ -209,6 +329,8 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
     connection->m_Parser.Reset();
     connection->m_Status = 0;
     connection->m_Opened = 0;
+    connection->m_FirstResponseTimedOut = 0;
+    connection->m_AttemptStart = dmTime::GetTime();
 
     struct curl_slist* headers = 0;
     headers = curl_slist_append(headers, "Accept: text/event-stream");
@@ -264,7 +386,14 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
 
     if (result != CURLE_OK)
     {
-        dmSnPrintf(error, error_size, "%s", curl_error[0] ? curl_error : curl_easy_strerror(result));
+        if (connection->m_FirstResponseTimedOut)
+        {
+            dmSnPrintf(error, error_size, "SSE timed out waiting for server response");
+        }
+        else
+        {
+            dmSnPrintf(error, error_size, "%s", curl_error[0] ? curl_error : curl_easy_strerror(result));
+        }
         return false;
     }
 
@@ -277,9 +406,9 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
     return true;
 }
 
-static void SSEDesktop_SleepRetry(SSEDesktopConnection* connection)
+static void SSEDesktop_SleepRetry(SSEDesktopConnection* connection, int32_t delay_ms)
 {
-    int32_t remaining = connection->m_RetryMS;
+    int32_t remaining = delay_ms;
     while (remaining > 0 && !SSEDesktop_ShouldStop(connection))
     {
         const int32_t step = remaining > 100 ? 100 : remaining;
@@ -292,6 +421,7 @@ static void SSEDesktop_Worker(void* data)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)data;
     uint32_t attempt = 0;
+    uint32_t failures = 0;
 
     while (!SSEDesktop_ShouldStop(connection))
     {
@@ -324,8 +454,14 @@ static void SSEDesktop_Worker(void* data)
             break;
         }
 
+        if (connection->m_Opened)
+        {
+            failures = 0;
+        }
+
         if (!ok)
         {
+            ++failures;
             SSE_EnqueueError(connection->m_Handle, error, connection->m_Status, connection->m_Reconnect != 0, connection->m_RetryMS);
         }
 
@@ -335,18 +471,28 @@ static void SSEDesktop_Worker(void* data)
             break;
         }
 
-        SSE_DebugLog("desktop retry sleep handle=%d retry_ms=%d", connection->m_Handle, connection->m_RetryMS);
-        SSEDesktop_SleepRetry(connection);
+        const int32_t delay_ms = SSEDesktop_ComputeRetryDelayMS(connection->m_RetryMS, failures);
+        SSE_DebugLog("desktop retry sleep handle=%d delay_ms=%d failures=%u", connection->m_Handle, delay_ms, failures);
+        SSEDesktop_SleepRetry(connection, delay_ms);
     }
 
     if (!SSEDesktop_ShouldStop(connection))
     {
         SSE_EnqueueClosed(connection->m_Handle);
     }
+
+    // Must be the last access to the connection: once the finished flag is
+    // set, the main thread may join and free it at any moment.
+    SSEDesktop_MarkFinished(connection);
 }
 
 bool SSE_Platform_Initialize()
 {
+    if (!g_SSEDesktopZombiesMutex)
+    {
+        g_SSEDesktopZombiesMutex = dmMutex::New();
+    }
+
     if (!g_CurlInitialized)
     {
         const CURLcode result = curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -363,6 +509,31 @@ bool SSE_Platform_Initialize()
 
 void SSE_Platform_Finalize()
 {
+    if (g_SSEDesktopZombiesMutex)
+    {
+        // Shutdown path: blocking joins are acceptable here. The workers have
+        // their stop flag set and observe it via the progress callback.
+        dmArray<SSEDesktopConnection*> zombies;
+        {
+            DM_MUTEX_SCOPED_LOCK(g_SSEDesktopZombiesMutex);
+            zombies.Swap(g_SSEDesktopZombies);
+        }
+
+        for (uint32_t i = 0; i < zombies.Size(); ++i)
+        {
+            SSEDesktopConnection* desktop = zombies[i];
+            if (desktop->m_Thread)
+            {
+                dmThread::Join(desktop->m_Thread);
+                desktop->m_Thread = 0;
+            }
+            SSEDesktop_Free(desktop);
+        }
+
+        dmMutex::Delete(g_SSEDesktopZombiesMutex);
+        g_SSEDesktopZombiesMutex = 0;
+    }
+
     if (g_CurlInitialized)
     {
         curl_global_cleanup();
@@ -438,33 +609,63 @@ void SSE_Platform_Disconnect(SSEConnection* connection)
         desktop->m_Stop = 1;
     }
 
-    if (desktop->m_Thread)
+    connection->m_PlatformData = 0;
+
+    if (!desktop->m_Thread)
     {
+        SSEDesktop_Free(desktop);
+        return;
+    }
+
+    if (SSEDesktop_IsFinished(desktop))
+    {
+        // The worker already exited; joining returns immediately.
         dmThread::Join(desktop->m_Thread);
         desktop->m_Thread = 0;
+        SSEDesktop_Free(desktop);
+        return;
     }
 
-    for (uint32_t i = 0; i < desktop->m_Headers.Size(); ++i)
+    // Never block the engine main thread waiting for the network worker; it
+    // is reaped from SSE_Platform_Update once it observes the stop flag.
+    DM_MUTEX_SCOPED_LOCK(g_SSEDesktopZombiesMutex);
+    if (g_SSEDesktopZombies.Full())
     {
-        free(desktop->m_Headers[i].m_Name);
-        free(desktop->m_Headers[i].m_Value);
+        g_SSEDesktopZombies.OffsetCapacity(4);
     }
-
-    if (desktop->m_Mutex)
-    {
-        dmMutex::Delete(desktop->m_Mutex);
-    }
-
-    free(desktop->m_Url);
-    free(desktop->m_LastEventId);
-    delete desktop;
-    connection->m_PlatformData = 0;
+    g_SSEDesktopZombies.Push(desktop);
 }
 
 bool SSE_Platform_IsConnected(SSEConnection* connection)
 {
     SSEDesktopConnection* desktop = (SSEDesktopConnection*)connection->m_PlatformData;
     return desktop && desktop->m_Opened != 0 && !SSEDesktop_ShouldStop(desktop);
+}
+
+void SSE_Platform_Update()
+{
+    if (!g_SSEDesktopZombiesMutex)
+    {
+        return;
+    }
+
+    DM_MUTEX_SCOPED_LOCK(g_SSEDesktopZombiesMutex);
+    uint32_t i = 0;
+    while (i < g_SSEDesktopZombies.Size())
+    {
+        SSEDesktopConnection* desktop = g_SSEDesktopZombies[i];
+        if (SSEDesktop_IsFinished(desktop))
+        {
+            dmThread::Join(desktop->m_Thread);
+            desktop->m_Thread = 0;
+            SSEDesktop_Free(desktop);
+            g_SSEDesktopZombies.EraseSwap(i);
+        }
+        else
+        {
+            ++i;
+        }
+    }
 }
 
 #elif defined(SSE_USE_WINHTTP)
@@ -486,6 +687,7 @@ struct SSEDesktopConnection
     uint8_t m_Reconnect;
     uint8_t m_Stop;
     uint8_t m_Opened;
+    uint8_t m_Finished;
 
     SSEDesktopConnection()
     : m_Handle(0)
@@ -501,9 +703,23 @@ struct SSEDesktopConnection
     , m_Reconnect(0)
     , m_Stop(0)
     , m_Opened(0)
+    , m_Finished(0)
     {
     }
 };
+
+// Connections whose worker thread had not exited when disconnect was called.
+// They are joined and freed from SSE_Platform_Update (engine main thread)
+// once the worker signals completion, so disconnect never blocks a frame.
+static dmArray<SSEDesktopConnection*> g_SSEDesktopZombies;
+static dmMutex::HMutex g_SSEDesktopZombiesMutex = 0;
+
+// Bound on how long the worker can sit in a blocking body read before it
+// wakes up; a receive timeout surfaces as a stream error and the normal
+// reconnect logic resumes the stream with Last-Event-ID.
+#define SSE_WINHTTP_BODY_RECEIVE_TIMEOUT_MS 300000
+// Bound on WinHttpReceiveResponse (time to response headers).
+#define SSE_WINHTTP_HEADER_RECEIVE_TIMEOUT_MS 30000
 
 struct SSEWinHTTPUrl
 {
@@ -546,6 +762,71 @@ static bool SSEDesktop_ShouldStop(SSEDesktopConnection* connection)
 {
     DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
     return connection->m_Stop != 0;
+}
+
+static void SSEDesktop_MarkFinished(SSEDesktopConnection* connection)
+{
+    DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
+    connection->m_Finished = 1;
+}
+
+static bool SSEDesktop_IsFinished(SSEDesktopConnection* connection)
+{
+    DM_MUTEX_SCOPED_LOCK(connection->m_Mutex);
+    return connection->m_Finished != 0;
+}
+
+static void SSEDesktop_Free(SSEDesktopConnection* desktop)
+{
+    for (uint32_t i = 0; i < desktop->m_Headers.Size(); ++i)
+    {
+        free(desktop->m_Headers[i].m_Name);
+        free(desktop->m_Headers[i].m_Value);
+    }
+
+    if (desktop->m_Mutex)
+    {
+        dmMutex::Delete(desktop->m_Mutex);
+    }
+
+    free(desktop->m_Url);
+    free(desktop->m_LastEventId);
+    delete desktop;
+}
+
+static int32_t SSEDesktop_ComputeRetryDelayMS(int32_t retry_ms, uint32_t failures)
+{
+    int64_t base = retry_ms;
+    if (base < SSE_DESKTOP_RETRY_MIN_MS)
+    {
+        base = SSE_DESKTOP_RETRY_MIN_MS;
+    }
+    if (base > SSE_DESKTOP_RETRY_MAX_MS)
+    {
+        base = SSE_DESKTOP_RETRY_MAX_MS;
+    }
+
+    uint32_t shift = failures > 1 ? failures - 1 : 0;
+    if (shift > SSE_DESKTOP_MAX_BACKOFF_SHIFT)
+    {
+        shift = SSE_DESKTOP_MAX_BACKOFF_SHIFT;
+    }
+
+    int64_t delay = base << shift;
+    if (delay > SSE_DESKTOP_RETRY_MAX_MS)
+    {
+        delay = SSE_DESKTOP_RETRY_MAX_MS;
+    }
+
+    // +-20% jitter so reconnecting clients spread out instead of stampeding.
+    const int64_t jitter = (int64_t)(dmTime::GetTime() % 401) - 200;
+    delay += (delay * jitter) / 1000;
+    if (delay < SSE_DESKTOP_MIN_DELAY_MS)
+    {
+        delay = SSE_DESKTOP_MIN_DELAY_MS;
+    }
+
+    return (int32_t)delay;
 }
 
 static void SSEWinHTTP_SetHandles(SSEDesktopConnection* connection, HINTERNET session, HINTERNET connect, HINTERNET request)
@@ -785,15 +1066,21 @@ static bool SSEWinHTTP_AddHeader(HINTERNET request, const char* name, const char
     return true;
 }
 
-static void SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
+static bool SSEDesktop_OnParserEvent(void* context, const SSEParsedEvent* event)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
-    if (event->m_Id && event->m_Id[0])
+    const bool enqueued = SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
+    if (enqueued && event->m_LastEventId)
     {
-        SSEDesktop_SetString(&connection->m_LastEventId, event->m_Id);
-        SSE_SetLastEventId(connection->m_Handle, event->m_Id);
+        // Commit the parser's persistent last-event-id buffer (which also
+        // carries id-only checkpoints and empty spec-legal resets) only when
+        // the event was actually delivered; otherwise a reconnect would skip
+        // the events dropped on queue overflow. On a drop the parser rolls
+        // the buffer back so a later commit cannot skip this event either.
+        SSEDesktop_SetString(&connection->m_LastEventId, event->m_LastEventId);
+        SSE_SetLastEventId(connection->m_Handle, event->m_LastEventId);
     }
-    SSE_EnqueueMessage(connection->m_Handle, event->m_Event, event->m_Data, event->m_Id);
+    return enqueued;
 }
 
 static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
@@ -804,9 +1091,17 @@ static void SSEDesktop_OnParserRetry(void* context, int retry_ms)
 
 static void SSEDesktop_OnParserId(void* context, const char* id)
 {
+    // An id-only checkpoint block carries no payload that could be dropped,
+    // so it is committed as the resume position immediately.
     SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
     SSEDesktop_SetString(&connection->m_LastEventId, id);
     SSE_SetLastEventId(connection->m_Handle, id);
+}
+
+static void SSEDesktop_OnParserError(void* context, const char* message)
+{
+    SSEDesktopConnection* connection = (SSEDesktopConnection*)context;
+    SSE_EnqueueError(connection->m_Handle, message, 0, connection->m_Reconnect != 0, connection->m_RetryMS);
 }
 
 static bool SSEWinHTTP_ReadStream(SSEDesktopConnection* connection, HINTERNET request, char* error, uint32_t error_size)
@@ -816,6 +1111,7 @@ static bool SSEWinHTTP_ReadStream(SSEDesktopConnection* connection, HINTERNET re
     callbacks.m_OnEvent = SSEDesktop_OnParserEvent;
     callbacks.m_OnRetry = SSEDesktop_OnParserRetry;
     callbacks.m_OnId = SSEDesktop_OnParserId;
+    callbacks.m_OnError = SSEDesktop_OnParserError;
 
     while (!SSEDesktop_ShouldStop(connection))
     {
@@ -887,7 +1183,9 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
         return false;
     }
     SSEWinHTTP_SetHandles(connection, session, 0, 0);
-    WinHttpSetTimeouts(session, 15000, 15000, 15000, 0);
+    // The receive timeout bounds WinHttpReceiveResponse, i.e. the time until
+    // response headers arrive; the body read gets a longer timeout below.
+    WinHttpSetTimeouts(session, 15000, 15000, 15000, SSE_WINHTTP_HEADER_RECEIVE_TIMEOUT_MS);
     if (SSEDesktop_ShouldStop(connection))
     {
         SSEWinHTTP_CloseActiveHandles(connection);
@@ -993,6 +1291,12 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
         return false;
     }
 
+    // Allow long idle periods on the open stream, but stay bounded so the
+    // worker can observe the stop flag without handles being closed from
+    // another thread; a timeout surfaces as a normal stream error/reconnect.
+    DWORD body_receive_timeout = SSE_WINHTTP_BODY_RECEIVE_TIMEOUT_MS;
+    WinHttpSetOption(request, WINHTTP_OPTION_RECEIVE_TIMEOUT, &body_receive_timeout, sizeof(body_receive_timeout));
+
     connection->m_Opened = 1;
     SSE_EnqueueOpen(connection->m_Handle, connection->m_Status);
     const bool stream_ok = SSEWinHTTP_ReadStream(connection, request, error, error_size);
@@ -1008,9 +1312,9 @@ static bool SSEDesktop_PerformOnce(SSEDesktopConnection* connection, char* error
     return stream_ok;
 }
 
-static void SSEDesktop_SleepRetry(SSEDesktopConnection* connection)
+static void SSEDesktop_SleepRetry(SSEDesktopConnection* connection, int32_t delay_ms)
 {
-    int32_t remaining = connection->m_RetryMS;
+    int32_t remaining = delay_ms;
     while (remaining > 0 && !SSEDesktop_ShouldStop(connection))
     {
         const int32_t step = remaining > 100 ? 100 : remaining;
@@ -1023,6 +1327,7 @@ static void SSEDesktop_Worker(void* data)
 {
     SSEDesktopConnection* connection = (SSEDesktopConnection*)data;
     uint32_t attempt = 0;
+    uint32_t failures = 0;
 
     while (!SSEDesktop_ShouldStop(connection))
     {
@@ -1055,8 +1360,14 @@ static void SSEDesktop_Worker(void* data)
             break;
         }
 
+        if (connection->m_Opened)
+        {
+            failures = 0;
+        }
+
         if (!ok)
         {
+            ++failures;
             SSE_EnqueueError(connection->m_Handle, error, connection->m_Status, connection->m_Reconnect != 0, connection->m_RetryMS);
         }
 
@@ -1066,23 +1377,63 @@ static void SSEDesktop_Worker(void* data)
             break;
         }
 
-        SSE_DebugLog("winhttp retry sleep handle=%d retry_ms=%d", connection->m_Handle, connection->m_RetryMS);
-        SSEDesktop_SleepRetry(connection);
+        const int32_t delay_ms = SSEDesktop_ComputeRetryDelayMS(connection->m_RetryMS, failures);
+        SSE_DebugLog("winhttp retry sleep handle=%d delay_ms=%d failures=%u", connection->m_Handle, delay_ms, failures);
+        SSEDesktop_SleepRetry(connection, delay_ms);
     }
 
     if (!SSEDesktop_ShouldStop(connection))
     {
         SSE_EnqueueClosed(connection->m_Handle);
     }
+
+    // Must be the last access to the connection: once the finished flag is
+    // set, the main thread may join and free it at any moment.
+    SSEDesktop_MarkFinished(connection);
 }
 
 bool SSE_Platform_Initialize()
 {
+    if (!g_SSEDesktopZombiesMutex)
+    {
+        g_SSEDesktopZombiesMutex = dmMutex::New();
+    }
     return true;
 }
 
 void SSE_Platform_Finalize()
 {
+    if (!g_SSEDesktopZombiesMutex)
+    {
+        return;
+    }
+
+    // Shutdown path: blocking joins are acceptable here. As a last resort the
+    // handles of a still-running worker are closed to abort its blocking
+    // read; this cross-thread close is confined to app exit.
+    dmArray<SSEDesktopConnection*> zombies;
+    {
+        DM_MUTEX_SCOPED_LOCK(g_SSEDesktopZombiesMutex);
+        zombies.Swap(g_SSEDesktopZombies);
+    }
+
+    for (uint32_t i = 0; i < zombies.Size(); ++i)
+    {
+        SSEDesktopConnection* desktop = zombies[i];
+        if (desktop->m_Thread)
+        {
+            if (!SSEDesktop_IsFinished(desktop))
+            {
+                SSEWinHTTP_CloseActiveHandles(desktop);
+            }
+            dmThread::Join(desktop->m_Thread);
+            desktop->m_Thread = 0;
+        }
+        SSEDesktop_Free(desktop);
+    }
+
+    dmMutex::Delete(g_SSEDesktopZombiesMutex);
+    g_SSEDesktopZombiesMutex = 0;
 }
 
 bool SSE_Platform_IsSupported()
@@ -1147,35 +1498,65 @@ void SSE_Platform_Disconnect(SSEConnection* connection)
         desktop->m_Stop = 1;
     }
 
-    SSEWinHTTP_CloseActiveHandles(desktop);
+    connection->m_PlatformData = 0;
 
-    if (desktop->m_Thread)
+    if (!desktop->m_Thread)
     {
+        SSEDesktop_Free(desktop);
+        return;
+    }
+
+    if (SSEDesktop_IsFinished(desktop))
+    {
+        // The worker already exited; joining returns immediately.
         dmThread::Join(desktop->m_Thread);
         desktop->m_Thread = 0;
+        SSEDesktop_Free(desktop);
+        return;
     }
 
-    for (uint32_t i = 0; i < desktop->m_Headers.Size(); ++i)
+    // Never block the engine main thread waiting for the network worker, and
+    // never close WinHTTP handles that the worker may be using in a blocking
+    // call: the worker unblocks itself via the receive timeouts, closes its
+    // own handles, and is reaped from SSE_Platform_Update.
+    DM_MUTEX_SCOPED_LOCK(g_SSEDesktopZombiesMutex);
+    if (g_SSEDesktopZombies.Full())
     {
-        free(desktop->m_Headers[i].m_Name);
-        free(desktop->m_Headers[i].m_Value);
+        g_SSEDesktopZombies.OffsetCapacity(4);
     }
-
-    if (desktop->m_Mutex)
-    {
-        dmMutex::Delete(desktop->m_Mutex);
-    }
-
-    free(desktop->m_Url);
-    free(desktop->m_LastEventId);
-    delete desktop;
-    connection->m_PlatformData = 0;
+    g_SSEDesktopZombies.Push(desktop);
 }
 
 bool SSE_Platform_IsConnected(SSEConnection* connection)
 {
     SSEDesktopConnection* desktop = (SSEDesktopConnection*)connection->m_PlatformData;
     return desktop && desktop->m_Opened != 0 && !SSEDesktop_ShouldStop(desktop);
+}
+
+void SSE_Platform_Update()
+{
+    if (!g_SSEDesktopZombiesMutex)
+    {
+        return;
+    }
+
+    DM_MUTEX_SCOPED_LOCK(g_SSEDesktopZombiesMutex);
+    uint32_t i = 0;
+    while (i < g_SSEDesktopZombies.Size())
+    {
+        SSEDesktopConnection* desktop = g_SSEDesktopZombies[i];
+        if (SSEDesktop_IsFinished(desktop))
+        {
+            dmThread::Join(desktop->m_Thread);
+            desktop->m_Thread = 0;
+            SSEDesktop_Free(desktop);
+            g_SSEDesktopZombies.EraseSwap(i);
+        }
+        else
+        {
+            ++i;
+        }
+    }
 }
 
 #else
@@ -1208,6 +1589,10 @@ void SSE_Platform_Disconnect(SSEConnection* connection)
 bool SSE_Platform_IsConnected(SSEConnection* connection)
 {
     return false;
+}
+
+void SSE_Platform_Update()
+{
 }
 
 #endif

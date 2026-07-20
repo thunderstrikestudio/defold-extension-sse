@@ -32,5 +32,9 @@ bool SSE_Platform_IsConnected(SSEConnection* connection)
     return false;
 }
 
+void SSE_Platform_Update()
+{
+}
+
 #endif
 
