@@ -11,7 +11,7 @@
 #include <string>
 
 #if defined(SSE_USE_LIBCURL)
-#include <curl/curl.h>
+#include "sse_curl_shim.h"
 #elif defined(SSE_USE_WINHTTP)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN

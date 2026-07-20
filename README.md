@@ -116,7 +116,7 @@ game.project
 
 The Android adapter declares OkHttp in `sse/manifests/android/build.gradle`. The iOS adapter uses only Foundation and does not require CocoaPods. The Windows adapter uses the system WinHTTP library and does not require bundled DLLs.
 
-Desktop macOS/Linux builds expect libcurl to be available in the native-extension build environment. If your Extender image does not provide libcurl, add platform libraries under `sse/lib/<arch-platform>/` and update `sse/ext.manifest`.
+Desktop macOS/Linux builds link against libcurl. A local shim is used when `curl/curl.h` is not available in the native-extension build environment, so Extender images do not need libcurl development headers. If your Extender image does not provide libcurl libraries, add platform libraries under `sse/lib/<arch-platform>/` and update `sse/ext.manifest`.
 
 ## Example
 
