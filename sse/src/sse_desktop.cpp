@@ -668,6 +668,10 @@ void SSE_Platform_Update()
     }
 }
 
+#elif defined(SSE_USE_DMCONNECTION)
+
+#include "sse_connection_pool_impl.h"
+
 #elif defined(SSE_USE_WINHTTP)
 
 struct SSEDesktopConnection

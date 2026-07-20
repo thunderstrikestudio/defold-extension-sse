@@ -116,7 +116,7 @@ game.project
 
 The Android adapter declares OkHttp in `sse/manifests/android/build.gradle`. The iOS adapter uses only Foundation and does not require CocoaPods. The Windows adapter uses the system WinHTTP library and does not require bundled DLLs.
 
-Desktop macOS/Linux builds link against libcurl. A local shim is used when `curl/curl.h` is not available in the native-extension build environment, so Extender images do not need libcurl development headers. If your Extender image does not provide libcurl libraries, add platform libraries under `sse/lib/<arch-platform>/` and update `sse/ext.manifest`.
+Desktop macOS builds link against libcurl. A local shim is used when `curl/curl.h` is not available in the native-extension build environment, so Extender images do not need libcurl development headers. Linux builds use Defold's connection pool and SSL socket APIs for `http://` and `https://` SSE endpoints, so Extender images do not need libcurl headers or libraries for Linux.
 
 ## Example
 
