@@ -30,11 +30,13 @@ platforms:
 
     x86-win32:
         context:
+            flags: ["-std=c++17", "-Wno-nontrivial-memcall"]
             defines: ["SSE_USE_WINHTTP"]
             libs: ["winhttp"]
 
     x86_64-win32:
         context:
+            flags: ["-std=c++17", "-Wno-nontrivial-memcall"]
             defines: ["SSE_USE_WINHTTP"]
             libs: ["winhttp"]
 

@@ -21,8 +21,9 @@ struct SSEHeader
     char* m_Value;
 
     SSEHeader()
+    : m_Name(0)
+    , m_Value(0)
     {
-        memset(this, 0, sizeof(*this));
     }
 };
 
@@ -39,8 +40,16 @@ struct SSEEvent
     char* m_Error;
 
     SSEEvent()
+    : m_Handle(0)
+    , m_Type(0)
+    , m_Status(0)
+    , m_RetryMS(0)
+    , m_Reconnect(0)
+    , m_Event(0)
+    , m_Data(0)
+    , m_Id(0)
+    , m_Error(0)
     {
-        memset(this, 0, sizeof(*this));
     }
 };
 
@@ -60,9 +69,18 @@ struct SSEConnection
     dmArray<SSEHeader> m_Headers;
 
     SSEConnection()
+    : m_Handle(0)
+    , m_Url(0)
+    , m_LastEventId(0)
+    , m_RetryMS(3000)
+    , m_Reconnect(0)
+    , m_Connected(0)
+    , m_UserClosed(0)
+    , m_Dispatching(0)
+    , m_DestroyAfterDispatch(0)
+    , m_PlatformData(0)
+    , m_Callback(0)
     {
-        memset(this, 0, sizeof(*this));
-        m_RetryMS = 3000;
     }
 };
 
@@ -91,4 +109,3 @@ bool SSE_Platform_IsConnected(SSEConnection* connection);
 void SSE_Platform_Update();
 
 #endif
-

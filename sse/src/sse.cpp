@@ -14,6 +14,11 @@ struct SSEEventQueue
     dmArray<int32_t> m_OverflowHandles;
     dmArray<int32_t> m_OverflowSwap;
     dmMutex::HMutex m_Mutex;
+
+    SSEEventQueue()
+    : m_Mutex(0)
+    {
+    }
 };
 
 struct SSEState
@@ -24,6 +29,14 @@ struct SSEState
     int32_t m_NextHandle;
     uint8_t m_Debug;
     uint8_t m_Initialized;
+
+    SSEState()
+    : m_Mutex(0)
+    , m_NextHandle(0)
+    , m_Debug(0)
+    , m_Initialized(0)
+    {
+    }
 };
 
 static SSEState g_SSE;
@@ -84,7 +97,15 @@ static void SSE_FreeEvent(SSEEvent* event)
     free(event->m_Data);
     free(event->m_Id);
     free(event->m_Error);
-    memset(event, 0, sizeof(*event));
+    event->m_Handle = 0;
+    event->m_Type = 0;
+    event->m_Status = 0;
+    event->m_RetryMS = 0;
+    event->m_Reconnect = 0;
+    event->m_Event = 0;
+    event->m_Data = 0;
+    event->m_Id = 0;
+    event->m_Error = 0;
 }
 
 static void SSE_FreeHeaders(dmArray<SSEHeader>& headers)
@@ -681,7 +702,6 @@ static void SSE_LuaInit(lua_State* L)
 
 static dmExtension::Result AppInitializeSSE(dmExtension::AppParams* params)
 {
-    memset(&g_SSE, 0, sizeof(g_SSE));
     g_SSE.m_NextHandle = 1;
     g_SSE.m_Debug = 0;
     g_SSE.m_Initialized = 1;
@@ -768,7 +788,9 @@ static dmExtension::Result AppFinalizeSSE(dmExtension::AppParams* params)
         g_SSE.m_Mutex = 0;
     }
 
-    memset(&g_SSE, 0, sizeof(g_SSE));
+    g_SSE.m_NextHandle = 0;
+    g_SSE.m_Debug = 0;
+    g_SSE.m_Initialized = 0;
     return dmExtension::RESULT_OK;
 }
 
